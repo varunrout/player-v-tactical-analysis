@@ -15,7 +15,8 @@ import math
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
-import json
+
+from src.utils import parse_extra_data
 
 
 # ============================================================================
@@ -218,7 +219,7 @@ class TeamMatchStyleCalculator:
         lengths = []
         progressions = []
         for p in passes:
-            extra = json.loads(p.get('extra_data', '{}')) if isinstance(p.get('extra_data'), str) else p.get('extra_data', {})
+            extra = parse_extra_data(p.get('extra_data'))
             if extra.get('pass_length'):
                 lengths.append(extra['pass_length'])
 
@@ -391,7 +392,7 @@ class TeamMatchStyleCalculator:
         header_shots = 0
 
         for shot in shots:
-            extra = json.loads(shot.get('extra_data', '{}')) if isinstance(shot.get('extra_data'), str) else shot.get('extra_data', {})
+            extra = parse_extra_data(shot.get('extra_data'))
             xg = extra.get('xg', 0)
             xg_total += xg
 
@@ -415,7 +416,7 @@ class TeamMatchStyleCalculator:
         # Crosses and through balls
         passes = [e for e in events if e.get('event_type') == 'pass']
         for p in passes:
-            extra = json.loads(p.get('extra_data', '{}')) if isinstance(p.get('extra_data'), str) else p.get('extra_data', {})
+            extra = parse_extra_data(p.get('extra_data'))
             if extra.get('cross'):
                 style.crosses += 1
             if extra.get('through_ball'):
@@ -745,7 +746,7 @@ class PlayerProfileCalculator:
 
     def _is_cross(self, pass_event: Dict) -> bool:
         """Check if pass is a cross."""
-        extra = json.loads(pass_event.get('extra_data', '{}')) if isinstance(pass_event.get('extra_data'), str) else pass_event.get('extra_data', {})
+        extra = parse_extra_data(pass_event.get('extra_data'))
         return extra.get('cross', False)
 
     def _calculate_dribbling(self, profile: PlayerSeasonProfile,
@@ -780,7 +781,7 @@ class PlayerProfileCalculator:
         on_target = 0
 
         for shot in shots:
-            extra = json.loads(shot.get('extra_data', '{}')) if isinstance(shot.get('extra_data'), str) else shot.get('extra_data', {})
+            extra = parse_extra_data(shot.get('extra_data'))
             xg_total += extra.get('xg', 0)
             if shot.get('outcome') == 'Goal':
                 goals += 1

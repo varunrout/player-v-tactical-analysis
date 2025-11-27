@@ -15,6 +15,8 @@ from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
+from src.utils import classify_team_style
+
 
 # ============================================================================
 # DATA STRUCTURES
@@ -468,9 +470,21 @@ class TacticalNarrativeGenerator:
     def _generate_clash_summary(self, team_a: TeamProfile, team_b: TeamProfile,
                                 features: MatchupFeatures) -> str:
         """Generate overview of style clash."""
-        # Determine primary styles
-        style_a = self._classify_style(team_a)
-        style_b = self._classify_style(team_b)
+        # Determine primary styles using shared utility
+        style_a = classify_team_style(
+            ppda=team_a.ppda,
+            high_press_pct=team_a.high_press_pct,
+            possession=team_a.possession,
+            transition_attack_rate=team_a.transition_attack_rate,
+            defensive_line_height=team_a.defensive_line_height
+        )
+        style_b = classify_team_style(
+            ppda=team_b.ppda,
+            high_press_pct=team_b.high_press_pct,
+            possession=team_b.possession,
+            transition_attack_rate=team_b.transition_attack_rate,
+            defensive_line_height=team_b.defensive_line_height
+        )
 
         return (
             f"This match features a clash between {team_a.team_name}'s "
@@ -479,17 +493,14 @@ class TacticalNarrativeGenerator:
         )
 
     def _classify_style(self, team: TeamProfile) -> str:
-        """Classify team's primary style."""
-        if team.ppda < 8 and team.high_press_pct > 40:
-            return "high-pressing, intense"
-        elif team.possession > 55:
-            return "possession-dominant"
-        elif team.transition_attack_rate > 15:
-            return "counter-attacking"
-        elif team.defensive_line_height < 40:
-            return "deep-block defensive"
-        else:
-            return "balanced"
+        """Classify team's primary style using shared utility."""
+        return classify_team_style(
+            ppda=team.ppda,
+            high_press_pct=team.high_press_pct,
+            possession=team.possession,
+            transition_attack_rate=team.transition_attack_rate,
+            defensive_line_height=team.defensive_line_height
+        )
 
     def _describe_tempo_battle(self, features: MatchupFeatures) -> str:
         """Describe the tempo battle between teams."""
@@ -728,8 +739,13 @@ def format_evolution_response(team_profile: TeamProfile,
             "transition_rate": team_profile.transition_attack_rate
         },
         "evolution_trend": historical_data,
-        "style_classification": MatchupCalculator()._classify_style(
-            team_profile) if hasattr(MatchupCalculator, '_classify_style') else "balanced"
+        "style_classification": classify_team_style(
+            ppda=team_profile.ppda,
+            high_press_pct=team_profile.high_press_pct,
+            possession=team_profile.possession,
+            transition_attack_rate=team_profile.transition_attack_rate,
+            defensive_line_height=team_profile.defensive_line_height
+        )
     }
 
 
