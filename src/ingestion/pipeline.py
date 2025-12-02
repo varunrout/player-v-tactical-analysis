@@ -15,6 +15,24 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 
+from sqlalchemy.orm import Session
+
+from src.ingestion.db import get_session
+from src.ingestion.schemas import (
+    RawMatch,
+    RawEvent,
+    RawLineup,
+    StgMatch,
+    StgEvent,
+    StgTeam,
+    StgPlayer,
+    FactMatch,
+    DimCompetition,
+    DimSeason,
+    DimTeam,
+)
+from src.ingestion.statsbomb_client import StatsBombClient
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -125,28 +143,43 @@ class JobIngestMatches(BaseETLJob):
         self.competition_ids = competition_ids or []
 
     def extract(self) -> List[Dict[str, Any]]:
+        """Fetch matches from source API.
+
+        For now we support StatsBomb Open via ``StatsBombClient`` using
+        competition + season identifiers. Date filtering is not applied at
+        the API level but can be added later using the match_date field.
         """
-        Fetch matches from source API.
 
-        Returns list of raw match records.
-        """
-        matches = []
+        if self.config.source != "statsbomb":
+            self.logger.warning("JobIngestMatches currently only implements statsbomb source")
+            return []
 
-        # Placeholder for actual API calls
-        # In production, this would call StatsBomb, Wyscout, or other APIs
-        self.logger.info(
-            f"Fetching matches from {self.config.source} "
-            f"between {self.start_date} and {self.end_date}"
-        )
+        if not self.competition_ids:
+            self.logger.warning("No competition_ids provided; nothing to ingest")
+            return []
 
-        # Example structure of fetched data
-        # matches = api_client.get_matches(
-        #     start_date=self.start_date,
-        #     end_date=self.end_date,
-        #     competition_ids=self.competition_ids
-        # )
+        client = StatsBombClient()
+        all_matches: List[Dict[str, Any]] = []
 
-        return matches
+        try:
+            for comp in self.competition_ids:
+                # Here we treat end_date year as the season identifier for simplicity
+                try:
+                    season_year = int(self.end_date.split("-")[0])
+                except Exception:
+                    season_year = None
+
+                if season_year is None:
+                    self.logger.warning("Could not infer season_id from end_date; skipping")
+                    continue
+
+                self.logger.info(f"Requesting matches for competition={comp}, season={season_year}")
+                matches = client.get_matches(int(comp), season_year)
+                all_matches.extend(matches)
+        finally:
+            client.close()
+
+        return all_matches
 
     def transform(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -171,14 +204,41 @@ class JobIngestMatches(BaseETLJob):
 
         Uses upsert logic to handle late-arriving updates.
         """
+        if not data:
+            return 0
+
         loaded_count = 0
 
-        # Placeholder for actual database operations
-        # In production:
-        # for batch in chunks(data, self.config.batch_size):
-        #     session.bulk_insert_mappings(RawMatch, batch)
-        #     loaded_count += len(batch)
-        # session.commit()
+        with get_session() as session:
+            for record in data:
+                source_match_id = record["source_match_id"]
+
+                existing = (
+                    session.query(RawMatch)
+                    .filter(
+                        RawMatch.source == self.config.source,
+                        RawMatch.source_match_id == source_match_id,
+                    )
+                    .one_or_none()
+                )
+
+                if existing:
+                    # Late-arriving update: replace raw_json and reset processed flag
+                    existing.raw_json = json.loads(record["raw_json"])
+                    existing.ingested_at = datetime.utcnow()
+                    existing.processed = False
+                else:
+                    session.add(
+                        RawMatch(
+                            source=self.config.source,
+                            source_match_id=source_match_id,
+                            raw_json=json.loads(record["raw_json"]),
+                            ingested_at=datetime.utcnow(),
+                            processed=False,
+                        )
+                    )
+
+                loaded_count += 1
 
         return loaded_count
 
@@ -201,23 +261,56 @@ class JobIngestEvents(BaseETLJob):
         self.match_ids = match_ids
 
     def extract(self) -> List[Dict[str, Any]]:
-        """Fetch events from source API."""
-        events = []
+        """Fetch events from source API.
+
+        For StatsBomb Open we hit the GitHub ``events/{match_id}.json``
+        endpoint via ``StatsBombClient.get_events``.
+        """
+
+        if self.config.source != "statsbomb":
+            self.logger.warning("JobIngestEvents currently only implements statsbomb source")
+            return []
 
         # If no specific matches provided, get unprocessed matches
         match_ids = self.match_ids or self._get_unprocessed_match_ids()
+        if not match_ids:
+            self.logger.info("No matches needing event ingestion")
+            return []
 
-        for match_id in match_ids:
-            self.logger.info(f"Fetching events for match {match_id}")
-            # match_events = api_client.get_events(match_id)
-            # events.extend(match_events)
+        client = StatsBombClient()
+        all_events: List[Dict[str, Any]] = []
+        try:
+            for match_id in match_ids:
+                self.logger.info(f"Fetching events for match {match_id}")
+                try:
+                    match_events = client.get_events(int(match_id))
+                except Exception as exc:
+                    self.logger.error(f"Failed to fetch events for match {match_id}: {exc}")
+                    continue
 
-        return events
+                for ev in match_events:
+                    ev["_match_id"] = match_id
+                all_events.extend(match_events)
+        finally:
+            client.close()
+
+        return all_events
 
     def _get_unprocessed_match_ids(self) -> List[str]:
-        """Get match IDs that need event ingestion."""
-        # Query raw_match where events not yet ingested
-        return []
+        """Get match IDs that need event ingestion.
+
+        For now we simply return all raw_match IDs for the configured
+        source. A more precise tracking of event ingestion can be added
+        later.
+        """
+
+        with get_session() as session:
+            rows: List[RawMatch] = (
+                session.query(RawMatch)
+                .filter(RawMatch.source == self.config.source)
+                .all()
+            )
+            return [str(r.source_match_id) for r in rows]
 
     def transform(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Prepare raw event data for loading."""
@@ -226,7 +319,7 @@ class JobIngestEvents(BaseETLJob):
             transformed.append({
                 'source': self.config.source,
                 'source_event_id': str(event.get('id', event.get('event_id'))),
-                'source_match_id': str(event.get('match_id')),
+                'source_match_id': str(event.get('_match_id', event.get('match_id'))),
                 'raw_json': json.dumps(event),
                 'ingested_at': datetime.utcnow().isoformat(),
                 'processed': False
@@ -234,9 +327,41 @@ class JobIngestEvents(BaseETLJob):
         return transformed
 
     def load(self, data: List[Dict[str, Any]]) -> int:
-        """Load raw events to database."""
+        """Load raw events to database with basic de-duplication."""
+
+        if not data:
+            return 0
+
         loaded_count = 0
-        # Batch insert logic here
+        with get_session() as session:
+            for record in data:
+                source_event_id = record["source_event_id"]
+                source_match_id = record["source_match_id"]
+
+                existing = (
+                    session.query(RawEvent)
+                    .filter(
+                        RawEvent.source == self.config.source,
+                        RawEvent.source_event_id == source_event_id,
+                        RawEvent.source_match_id == source_match_id,
+                    )
+                    .one_or_none()
+                )
+                if existing:
+                    continue
+
+                session.add(
+                    RawEvent(
+                        source=self.config.source,
+                        source_event_id=source_event_id,
+                        source_match_id=source_match_id,
+                        raw_json=json.loads(record["raw_json"]),
+                        ingested_at=datetime.utcnow(),
+                        processed=False,
+                    )
+                )
+                loaded_count += 1
+
         return loaded_count
 
 
@@ -263,9 +388,28 @@ class JobStageMatches(BaseETLJob):
         self.batch_size = batch_size
 
     def extract(self) -> List[Dict[str, Any]]:
-        """Get unprocessed raw matches."""
-        # SELECT * FROM raw_match WHERE processed = FALSE AND source = ?
-        return []
+        """Get unprocessed raw matches for this source.
+
+        For now we pull all unprocessed rows for the configured source. In a
+        production system you would likely batch by date or competition.
+        """
+
+        with get_session() as session:
+            rows: List[RawMatch] = (
+                session.query(RawMatch)
+                .filter(RawMatch.processed.is_(False), RawMatch.source == self.config.source)
+                .all()
+            )
+
+            return [
+                {
+                    "id": r.id,
+                    "source": r.source,
+                    "source_match_id": r.source_match_id,
+                    "raw_json": r.raw_json,
+                }
+                for r in rows
+            ]
 
     def transform(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -352,10 +496,195 @@ class JobStageMatches(BaseETLJob):
         }
 
     def load(self, data: List[Dict[str, Any]]) -> int:
-        """Load staged matches and mark raw as processed."""
-        loaded_count = 0
-        # INSERT INTO stg_match and UPDATE raw_match SET processed = TRUE
-        return loaded_count
+        """Load staged matches and mark corresponding raw rows as processed.
+
+        This method writes into ``stg_match`` and flips the ``processed`` flag
+        on ``raw_match`` so that subsequent runs only operate on new data.
+        """
+
+        if not data:
+            return 0
+
+        with get_session() as session:
+            loaded_count = 0
+            for staged in data:
+                # Insert into staging table
+                stg = StgMatch(
+                    source=staged["source"],
+                    source_match_id=staged["source_match_id"],
+                    home_team_source_id=staged["home_team_source_id"],
+                    away_team_source_id=staged["away_team_source_id"],
+                    competition_source_id=staged["competition_source_id"],
+                    season_name=staged["season_name"],
+                    match_date=staged["match_date"],
+                    match_time=staged["match_time"],
+                    home_score=staged["home_score"],
+                    away_score=staged["away_score"],
+                    status=staged["status"],
+                    stadium=staged["stadium"],
+                    referee=staged["referee"],
+                    attendance=staged["attendance"],
+                )
+                session.add(stg)
+
+                # Mark raw row as processed using (source, source_match_id)
+                session.query(RawMatch).filter(
+                    RawMatch.source == staged["source"],
+                    RawMatch.source_match_id == staged["source_match_id"],
+                ).update({"processed": True})
+
+                loaded_count += 1
+
+            return loaded_count
+
+
+def _get_or_create_dim_team(session: Session, name: str, source: str, source_team_id: str) -> int:
+    """Resolve or create a ``DimTeam`` record for a StatsBomb team.
+
+    For now we maintain a single name + source_id mapping; later this can be
+    expanded to use the full ``EntityMapper`` abstraction.
+    """
+
+    query = session.query(DimTeam)
+    if source == "statsbomb":
+        query = query.filter(DimTeam.statsbomb_id == source_team_id)
+    else:
+        query = query.filter(DimTeam.team_name == name)
+
+    existing = query.one_or_none()
+    if existing:
+        return existing.team_id
+
+    team = DimTeam(team_name=name)
+    if source == "statsbomb":
+        team.statsbomb_id = source_team_id
+    session.add(team)
+    session.flush()
+    return team.team_id
+
+
+def _get_or_create_dim_competition(session: Session, name: str, source: str, source_id: str) -> int:
+    """Resolve or create a ``DimCompetition`` record."""
+
+    from src.ingestion.schemas import DimCompetition
+
+    query = session.query(DimCompetition)
+    if source == "statsbomb":
+        query = query.filter(DimCompetition.statsbomb_id == source_id)
+    else:
+        query = query.filter(DimCompetition.competition_name == name)
+
+    existing = query.one_or_none()
+    if existing:
+        return existing.competition_id
+
+    comp = DimCompetition(competition_name=name)
+    if source == "statsbomb":
+        comp.statsbomb_id = source_id
+    session.add(comp)
+    session.flush()
+    return comp.competition_id
+
+
+def _get_or_create_dim_season(session: Session, season_name: str) -> int:
+    """Resolve or create a ``DimSeason`` from a StatsBomb-like season string.
+
+    StatsBomb typically uses labels like "2019/2020"; here we approximate
+    ``start_date``/``end_date`` using the start and end years.
+    """
+
+    season = session.query(DimSeason).filter(DimSeason.season_name == season_name).one_or_none()
+    if season:
+        return season.season_id
+
+    # Heuristic: split on '/' to infer start/end years, fall back to 1 July
+    start_year = None
+    end_year = None
+    try:
+        parts = season_name.split("/")
+        if len(parts) == 2:
+            start_year = int(parts[0])
+            end_year = int(parts[1])
+    except Exception:
+        pass
+
+    if start_year is None or end_year is None:
+        # Fallback: use match date year span; here we just set something valid
+        start_year = datetime.utcnow().year
+        end_year = start_year
+
+    start_date = datetime(start_year, 7, 1).date()
+    end_date = datetime(end_year, 6, 30).date()
+
+    season = DimSeason(season_name=season_name, start_date=start_date, end_date=end_date)
+    session.add(season)
+    session.flush()
+    return season.season_id
+
+
+def load_fact_matches_from_staging(session: Session, source: str) -> int:
+    """Materialize ``FactMatch`` records from ``StgMatch`` rows for a source.
+
+    This provides the ``StgMatch → FactMatch`` leg of the pipeline.
+    """
+
+    staged_matches: List[StgMatch] = session.query(StgMatch).filter(StgMatch.source == source).all()
+    created = 0
+
+    for stg in staged_matches:
+        # Resolve dimensions
+        home_team_id = _get_or_create_dim_team(
+            session,
+            name=stg.home_team_source_id,
+            source=source,
+            source_team_id=stg.home_team_source_id,
+        )
+        away_team_id = _get_or_create_dim_team(
+            session,
+            name=stg.away_team_source_id,
+            source=source,
+            source_team_id=stg.away_team_source_id,
+        )
+
+        competition_id = _get_or_create_dim_competition(
+            session,
+            name=stg.competition_source_id,
+            source=source,
+            source_id=stg.competition_source_id,
+        )
+
+        season_id = _get_or_create_dim_season(session, stg.season_name)
+
+        # Upsert-style behaviour based on (source, source_match_id)
+        existing = (
+            session.query(FactMatch)
+            .filter(FactMatch.source == source, FactMatch.source_match_id == stg.source_match_id)
+            .one_or_none()
+        )
+        if existing:
+            continue
+
+        fact = FactMatch(
+            home_team_id=home_team_id,
+            away_team_id=away_team_id,
+            competition_id=competition_id,
+            season_id=season_id,
+            home_score=stg.home_score,
+            away_score=stg.away_score,
+            match_date=stg.match_date,
+            match_time=stg.match_time,
+            status=stg.status or "finished",
+            stadium=stg.stadium,
+            attendance=stg.attendance,
+            referee=stg.referee,
+            source=source,
+            source_match_id=stg.source_match_id,
+        )
+        session.add(fact)
+        created += 1
+
+    return created
+
 
 
 class JobStageEvents(BaseETLJob):
@@ -401,8 +730,25 @@ class JobStageEvents(BaseETLJob):
         super().__init__(config)
 
     def extract(self) -> List[Dict[str, Any]]:
-        """Get unprocessed raw events."""
-        return []
+        """Get unprocessed raw events for this source."""
+
+        with get_session() as session:
+            rows: List[RawEvent] = (
+                session.query(RawEvent)
+                .filter(RawEvent.processed.is_(False), RawEvent.source == self.config.source)
+                .all()
+            )
+
+            return [
+                {
+                    "id": r.id,
+                    "source": r.source,
+                    "source_event_id": r.source_event_id,
+                    "source_match_id": r.source_match_id,
+                    "raw_json": r.raw_json,
+                }
+                for r in rows
+            ]
 
     def transform(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Transform raw events to staging format."""
@@ -593,8 +939,42 @@ class JobStageEvents(BaseETLJob):
         }
 
     def load(self, data: List[Dict[str, Any]]) -> int:
-        """Load staged events."""
-        return len(data)
+        """Load staged events and mark corresponding raw rows as processed."""
+
+        if not data:
+            return 0
+
+        with get_session() as session:
+            loaded_count = 0
+            for staged in data:
+                stg = StgEvent(
+                    source=staged["source"],
+                    source_event_id=staged["source_event_id"],
+                    source_match_id=staged["source_match_id"],
+                    event_type=staged["event_type"],
+                    event_subtype=staged["event_subtype"],
+                    minute=staged["minute"],
+                    second=staged["second"],
+                    period=staged["period"],
+                    location_x=staged["location_x"],
+                    location_y=staged["location_y"],
+                    end_location_x=staged["end_location_x"],
+                    end_location_y=staged["end_location_y"],
+                    player_source_id=staged["player_source_id"],
+                    team_source_id=staged["team_source_id"],
+                    outcome=staged["outcome"],
+                    is_successful=staged["is_successful"],
+                    extra_data=staged["extra_data"],
+                )
+                session.add(stg)
+
+                raw_id = staged.get("id")
+                if raw_id is not None:
+                    session.query(RawEvent).filter(RawEvent.id == raw_id).update({"processed": True})
+
+                loaded_count += 1
+
+            return loaded_count
 
 
 class JobStageEntities(BaseETLJob):
@@ -614,16 +994,105 @@ class JobStageEntities(BaseETLJob):
         super().__init__(config)
 
     def extract(self) -> List[Dict[str, Any]]:
-        """Extract entity references from raw tables."""
-        entities = {
-            'teams': [],
-            'players': []
-        }
+        """Extract entity references from raw tables.
 
-        # Query raw tables for entity data
-        # Deduplicate by source + source_id
+        We scan ``raw_match``, ``raw_event`` and ``raw_lineup`` for
+        distinct team and player objects.
+        """
 
-        return [entities]
+        teams: Dict[str, Dict[str, Any]] = {}
+        players: Dict[str, Dict[str, Any]] = {}
+
+        with get_session() as session:
+            # From raw_match: home/away teams
+            raw_matches: List[RawMatch] = (
+                session.query(RawMatch)
+                .filter(RawMatch.source == self.config.source)
+                .all()
+            )
+            for r in raw_matches:
+                data = r.raw_json if isinstance(r.raw_json, dict) else json.loads(r.raw_json)
+                home = data.get('home_team') or {}
+                away = data.get('away_team') or {}
+                if home.get('home_team_id') is not None:
+                    key = f"team:{home['home_team_id']}"
+                    teams.setdefault(key, {
+                        'id': home.get('home_team_id'),
+                        'name': home.get('home_team_name'),
+                        'short_name': home.get('home_team_name'),
+                        'country': None,
+                    })
+                if away.get('away_team_id') is not None:
+                    key = f"team:{away['away_team_id']}"
+                    teams.setdefault(key, {
+                        'id': away.get('away_team_id'),
+                        'name': away.get('away_team_name'),
+                        'short_name': away.get('away_team_name'),
+                        'country': None,
+                    })
+
+            # From raw_event: players and teams
+            raw_events: List[RawEvent] = (
+                session.query(RawEvent)
+                .filter(RawEvent.source == self.config.source)
+                .all()
+            )
+            for r in raw_events:
+                ev = r.raw_json if isinstance(r.raw_json, dict) else json.loads(r.raw_json)
+                player = ev.get('player') or {}
+                team = ev.get('team') or {}
+                if player.get('id') is not None:
+                    key = f"player:{player['id']}"
+                    players.setdefault(key, {
+                        'id': player.get('id'),
+                        'name': player.get('name'),
+                        'first_name': None,
+                        'last_name': None,
+                        'date_of_birth': None,
+                        'nationality': None,
+                        'position': None,
+                        'height_cm': None,
+                        'weight_kg': None,
+                        'preferred_foot': None,
+                    })
+                if team.get('id') is not None:
+                    key = f"team:{team['id']}"
+                    teams.setdefault(key, {
+                        'id': team.get('id'),
+                        'name': team.get('name'),
+                        'short_name': team.get('name'),
+                        'country': None,
+                    })
+
+            # From raw_lineup: richer player metadata if available
+            raw_lineups: List[RawLineup] = (
+                session.query(RawLineup)
+                .filter(RawLineup.source == self.config.source)
+                .all()
+            )
+            for r in raw_lineups:
+                lineup = r.raw_json if isinstance(r.raw_json, dict) else json.loads(r.raw_json)
+                for player in lineup.get('lineup', []):
+                    if player.get('player_id') is None:
+                        continue
+                    key = f"player:{player['player_id']}"
+                    players[key] = {
+                        'id': player.get('player_id'),
+                        'name': player.get('player_name'),
+                        'first_name': None,
+                        'last_name': None,
+                        'date_of_birth': player.get('birth_date'),
+                        'nationality': player.get('country'),
+                        'position': player.get('position'),
+                        'height_cm': None,
+                        'weight_kg': None,
+                        'preferred_foot': None,
+                    }
+
+        return [{
+            'teams': list(teams.values()),
+            'players': list(players.values()),
+        }]
 
     def transform(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Standardize entity data."""
@@ -670,15 +1139,36 @@ class JobStageEntities(BaseETLJob):
         entities = data[0]
         loaded_count = 0
 
-        # Load teams
-        for team in entities.get('teams', []):
-            # INSERT INTO stg_team ...
-            loaded_count += 1
+        with get_session() as session:
+            # Load teams
+            for team in entities.get('teams', []):
+                stg_team = StgTeam(
+                    source=self.config.source,
+                    source_team_id=str(team['id']),
+                    name=team['name'],
+                    short_name=team.get('short_name'),
+                    country=team.get('country'),
+                )
+                session.add(stg_team)
+                loaded_count += 1
 
-        # Load players
-        for player in entities.get('players', []):
-            # INSERT INTO stg_player ...
-            loaded_count += 1
+            # Load players
+            for player in entities.get('players', []):
+                stg_player = StgPlayer(
+                    source=self.config.source,
+                    source_player_id=str(player['id']),
+                    name=player['name'],
+                    first_name=player.get('first_name'),
+                    last_name=player.get('last_name'),
+                    date_of_birth=player.get('date_of_birth'),
+                    nationality=player.get('nationality'),
+                    position=player.get('position'),
+                    height_cm=player.get('height_cm'),
+                    weight_kg=player.get('weight_kg'),
+                    preferred_foot=player.get('preferred_foot'),
+                )
+                session.add(stg_player)
+                loaded_count += 1
 
         return loaded_count
 
