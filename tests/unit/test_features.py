@@ -1,5 +1,6 @@
 """Tests for feature engineering module."""
 
+import pandas as pd
 import pytest
 from src.features.engineering import (
     TeamMatchStyle,
@@ -11,6 +12,8 @@ from src.features.engineering import (
     SquadSeasonSkill,
     aggregate_squad_skill,
     PITCH_ZONES,
+    compute_player_match_features_from_events,
+    compute_team_match_features_from_events,
 )
 
 
@@ -327,3 +330,188 @@ class TestSquadSkillAggregation:
 
         # Weighted: (90*900 + 60*300) / 1200 = 82.5
         assert result.squad_pass_accuracy == pytest.approx(82.5, rel=0.01)
+
+
+class TestFeatureBuilders:
+    """Tests for the lightweight feature builder helpers."""
+
+    def test_compute_player_match_features_progressions(self):
+        """Player feature frame captures progressions, xG, and regains."""
+
+        shared = {
+            'source': 'statsbomb',
+            'competition_id': 1,
+            'competition_source_id': 'league_1',
+            'season_id': 99,
+            'season_name': '2020/21',
+            'match_id': 1001,
+            'team_id': 10,
+            'team_source_id': 'team_a',
+            'player_source_id': 'player_1',
+            'home_score': 2,
+            'away_score': 1,
+            'is_home': True,
+        }
+
+        events = pd.DataFrame([
+            {
+                **shared,
+                'event_type': 'pass',
+                'event_subtype': None,
+                'minute': 5,
+                'second': 0,
+                'location_x': 40,
+                'location_y': 50,
+                'end_location_x': 72,
+                'end_location_y': 60,
+                'is_successful': True,
+                'extra_data': {'pass_length': 30},
+            },
+            {
+                **shared,
+                'event_type': 'pass',
+                'minute': 10,
+                'second': 0,
+                'location_x': 20,
+                'location_y': 40,
+                'end_location_x': 25,
+                'end_location_y': 45,
+                'is_successful': False,
+                'extra_data': {'pass_length': 6},
+            },
+            {
+                **shared,
+                'event_type': 'carry',
+                'minute': 20,
+                'second': 0,
+                'location_x': 60,
+                'location_y': 40,
+                'end_location_x': 80,
+                'end_location_y': 42,
+                'is_successful': True,
+                'extra_data': {'carry_distance': 18},
+            },
+            {
+                **shared,
+                'event_type': 'dribble',
+                'minute': 25,
+                'second': 0,
+                'location_x': 70,
+                'location_y': 50,
+                'is_successful': True,
+                'extra_data': {},
+            },
+            {
+                **shared,
+                'event_type': 'shot',
+                'minute': 30,
+                'second': 0,
+                'location_x': 82,
+                'location_y': 52,
+                'is_successful': True,
+                'extra_data': {'xg': 0.2, 'type': 'Open Play'},
+            },
+            {
+                **shared,
+                'event_type': 'pressure',
+                'minute': 40,
+                'second': 0,
+                'location_x': 70,
+                'location_y': 55,
+                'extra_data': {},
+            },
+            {
+                **shared,
+                'event_type': 'ball_recovery',
+                'minute': 40,
+                'second': 3,
+                'location_x': 72,
+                'location_y': 50,
+                'extra_data': {},
+            },
+            {
+                **shared,
+                'event_type': 'miscontrol',
+                'minute': 50,
+                'second': 0,
+                'location_x': 55,
+                'location_y': 48,
+                'extra_data': {},
+            },
+        ])
+
+        result = compute_player_match_features_from_events(events)
+        assert len(result) == 1
+        row = result.iloc[0]
+        assert row['progressive_passes'] == 1
+        assert row['progressive_carries'] == 1
+        assert row['final_third_entries'] == 2
+        assert row['xg'] == pytest.approx(0.2, rel=1e-3)
+        assert row['pressure_regains'] == 1
+
+    def test_compute_team_match_features_basic(self):
+        """Team feature frame captures PPDA, build-up, and outcome."""
+
+        shared_home = {
+            'source': 'statsbomb',
+            'competition_id': 1,
+            'competition_source_id': 'league_1',
+            'season_id': 99,
+            'season_name': '2020/21',
+            'match_id': 555,
+            'home_score': 2,
+            'away_score': 1,
+        }
+
+        team_a = {
+            'team_id': 10,
+            'team_source_id': 'team_a',
+            'is_home': True,
+        }
+        team_b = {
+            'team_id': 20,
+            'team_source_id': 'team_b',
+            'is_home': False,
+        }
+
+        events = pd.DataFrame([
+            {**shared_home, **team_a, 'event_type': 'pass', 'minute': 5, 'second': 0, 'location_x': 20, 'location_y': 40,
+             'end_location_x': 55, 'end_location_y': 45, 'player_source_id': 'a1', 'is_successful': True,
+             'extra_data': {'pass_length': 35}},
+            {**shared_home, **team_a, 'event_type': 'pass', 'minute': 15, 'second': 0, 'location_x': 70, 'location_y': 10,
+             'end_location_x': 80, 'end_location_y': 12, 'player_source_id': 'a1', 'is_successful': True,
+             'extra_data': {'pass_length': 14, 'cross': True}},
+            {**shared_home, **team_a, 'event_type': 'pass', 'minute': 18, 'second': 0, 'location_x': 60, 'location_y': 50,
+             'end_location_x': 75, 'end_location_y': 48, 'player_source_id': 'a2', 'is_successful': True,
+             'extra_data': {'pass_length': 18, 'through_ball': True}},
+            {**shared_home, **team_a, 'event_type': 'carry', 'minute': 19, 'second': 0, 'location_x': 45, 'location_y': 45,
+             'end_location_x': 70, 'end_location_y': 46, 'player_source_id': 'a3', 'is_successful': True,
+             'extra_data': {'carry_distance': 25}},
+            {**shared_home, **team_a, 'event_type': 'pressure', 'minute': 20, 'second': 0, 'location_x': 70, 'location_y': 50,
+             'player_source_id': 'a4', 'is_successful': False, 'extra_data': {}},
+            {**shared_home, **team_a, 'event_type': 'ball_recovery', 'minute': 20, 'second': 3, 'location_x': 72, 'location_y': 52,
+             'player_source_id': 'a4', 'is_successful': True, 'extra_data': {}},
+            {**shared_home, **team_a, 'event_type': 'tackle', 'minute': 30, 'second': 0, 'location_x': 55, 'location_y': 45,
+             'player_source_id': 'a5', 'is_successful': True, 'extra_data': {}},
+            {**shared_home, **team_a, 'event_type': 'shot', 'minute': 40, 'second': 0, 'location_x': 85, 'location_y': 48,
+             'player_source_id': 'a6', 'is_successful': True, 'extra_data': {'xg': 0.3, 'type': 'Open Play'}},
+            {**shared_home, **team_a, 'event_type': 'ball_receipt', 'minute': 50, 'second': 0, 'location_x': 60, 'location_y': 50,
+             'player_source_id': 'a7', 'is_successful': True, 'extra_data': {}},
+            {**shared_home, **team_b, 'event_type': 'pass', 'minute': 7, 'second': 0, 'location_x': 40, 'location_y': 55,
+             'end_location_x': 45, 'end_location_y': 50, 'player_source_id': 'b1', 'is_successful': True,
+             'extra_data': {'pass_length': 8}},
+            {**shared_home, **team_b, 'event_type': 'pass', 'minute': 12, 'second': 0, 'location_x': 70, 'location_y': 60,
+             'end_location_x': 75, 'end_location_y': 62, 'player_source_id': 'b1', 'is_successful': True,
+             'extra_data': {'pass_length': 7}},
+            {**shared_home, **team_b, 'event_type': 'ball_recovery', 'minute': 13, 'second': 0, 'location_x': 55, 'location_y': 40,
+             'player_source_id': 'b2', 'is_successful': True, 'extra_data': {}},
+        ])
+
+        result = compute_team_match_features_from_events(events)
+        assert set(result['team_source_id']) == {'team_a', 'team_b'}
+
+        team_row = result[result['team_source_id'] == 'team_a'].iloc[0]
+        assert team_row['match_outcome'] == 'W'
+        assert team_row['ppda'] is not None
+        assert team_row['build_up_pass_share'] > 0
+        assert team_row['cross_rate'] > 0

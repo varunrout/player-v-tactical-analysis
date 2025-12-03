@@ -26,7 +26,7 @@ Phase 2 centers around three modules:
 - `src/ingestion/schemas.py` – ORM models for raw, staging, dimensions, facts, and history.
 - `src/ingestion/db.py` – database bootstrap and session helper.
 - `src/ingestion/pipeline.py` – ETL jobs (ingest, stage, entities, fact loaders, pipeline orchestrator).
-- `src/ingestion/statsbomb_client.py` – thin HTTP client for StatsBomb Open (matches and events).
+- `src/ingestion/statsbomb_client.py` – thin HTTP client for StatsBomb Open (matches, events, and lineups).
 
 ### 2.1. Layered Schema Design
 
@@ -94,10 +94,15 @@ The client is intentionally tiny and aligned with the official open‑data GitHu
     - Requests `events/{match_id}.json`.
     - Path overridable via `STATSBOMB_EVENTS_PATH`.
     - Returns a list of event dicts.
+- **Lineups endpoint:**
+  - `get_lineups(match_id: int)`:
+    - Requests `lineups/{match_id}.json`.
+    - Path overridable via `STATSBOMB_LINEUPS_PATH`.
+    - Returns the per-team lineup payloads used downstream for player metadata and FactLineup creation.
 
 **Testing:**
 
-- `tests/unit/test_statsbomb_client.py` validates URL construction and clean handling of HTTP 404s without relying on any particular file being present.
+- `tests/unit/test_statsbomb_client.py` validates URL construction and clean handling of HTTP 404s for both matches and lineups without relying on any particular file being present.
 
 ---
 
@@ -150,6 +155,20 @@ Location: `src/ingestion/pipeline.py`.
 
 This completes the **Raw** part of the matches + events path.
 
+### 5.3. `JobIngestLineups`
+
+**Purpose:** Capture StatsBomb lineup payloads per match/team into `RawLineup` so downstream entity staging and FactLineup construction have the richer roster context.
+
+- **Extract:**
+  - Supports StatsBomb by default.
+  - Pulls explicit `match_ids` if provided; otherwise inspects `RawMatch` and `RawLineup` to find matches missing one or both team lineup records.
+  - Calls `StatsBombClient.get_lineups(match_id)` once per match.
+- **Transform:**
+  - Splits the lineup payload into one record per team, preserving `team_id`, `team_name`, and the full `lineup` array.
+- **Load:**
+  - Upserts into `RawLineup` keyed by `(source, source_match_id, source_team_id)` and resets `processed=False` so derived jobs can re-run if new data arrives.
+  - Stores JSON columns as parsed dicts and timestamps `ingested_at`.
+
 ---
 
 ## 6. Staging Jobs – Normalization
@@ -166,12 +185,12 @@ This completes the **Raw** part of the matches + events path.
     - `statsbomb` → `_parse_statsbomb_match`.
     - `wyscout` → `_parse_wyscout_match`.
     - fallback → `_parse_generic_match`.
-  - StatsBomb parser extracts:
-    - Team IDs (`home_team.home_team_id`, `away_team.away_team_id`).
-    - Competition ID (`competition.competition_id`).
-    - `season_name`, `match_date`, `kick_off`.
-    - Scores, status (maps `match_status == "available"` to `"finished"`).
-    - Stadium, referee, attendance.
+  - StatsBomb parser now extracts an expanded set of metadata:
+    - Team IDs and display names for both sides.
+    - Competition IDs plus human-readable names and stages.
+    - `season_name`, `match_date`, `kick_off`, and `match_week` when present.
+    - Scores, normalized status, stadium, referee, attendance.
+  - *Migration note:* If you populated the database before this enhancement, re-running `init_db()` (or issuing an `ALTER TABLE stg_match` with the new columns) is required so the additional attributes persist.
   - Adds `source` and `source_match_id` to the staged record.
 - **Load:**
   - Inserts `StgMatch` rows with all normalized fields.
@@ -189,7 +208,7 @@ This completes the **Raw** part of the matches + events path.
     - `statsbomb` → `_parse_statsbomb_event`.
       - Normalizes 120×80 coordinates to 0–100 scale.
       - Maps raw types via `EVENT_TYPE_MAPPING`.
-      - Derives subtype (technique), outcome, success flags, xG, pass details, carry distance, etc.
+      - Derives subtype (technique), outcome, extended success heuristics, xG, pass/shot metadata, progressive flags, possession IDs, and carry distance.
     - `wyscout` and generic branches preserved for future sources.
   - Adds `source`, `source_event_id`, `source_match_id`.
 - **Load:**
@@ -228,13 +247,14 @@ This gives us a clean staging layer for entity dimensions.
 
 Defined in `pipeline.py`:
 
-- `_get_or_create_dim_team(session, name, source, source_team_id)`:
-  - For `source == "statsbomb"`, uses `DimTeam.statsbomb_id`.
-  - Otherwise falls back to `team_name`.
+- `_get_or_create_dim_team(session, source, source_team_id, team_name=None, ...)`:
+  - Uses StatsBomb IDs when present and falls back to staged team metadata so we always capture names/countries.
 - `_get_or_create_dim_competition(session, name, source, source_id)`:
   - Uses `DimCompetition.statsbomb_id` for StatsBomb; `competition_name` otherwise.
 - `_get_or_create_dim_season(session, season_name)`:
   - Looks up by `season_name`; if missing, parses a `"YYYY/YYYY"` string to approximate `start_date` and `end_date`.
+- `_get_or_create_dim_player(session, source, source_player_id, fallback_name=None)`:
+  - Builds `DimPlayer` rows on demand using the richer details captured in `StgPlayer`/lineup payloads.
 
 ### 7.2. `load_fact_matches_from_staging`
 
@@ -247,12 +267,23 @@ Defined in `pipeline.py`:
   - Checks for an existing `FactMatch` with `(source, source_match_id)`.
   - If not present, inserts a new `FactMatch` row with:
     - Dimension IDs.
-    - Scores, date, time, status, stadium, attendance, referee.
+    - Scores, date, time, matchweek, stadium, attendance, referee.
     - `source` and `source_match_id`.
 
-This provides a full **Raw → Staging → Fact** path for matches, with dimensions attached.
+This provides a full **Raw → Staging → Fact** path for matches, with dimensions (and now richer match metadata) attached.
 
-(*Note:* Similar helpers and loaders can be implemented for `FactEvent` and `FactLineup` in later iterations.)
+### 7.3. `load_fact_events_from_staging`
+
+- Reads `StgEvent` rows for a source.
+- Resolves `FactMatch`, `DimTeam`, and `DimPlayer` IDs before inserting into `FactEvent`.
+- Copies normalized coordinates plus enriched metadata such as xG, pass length/angle, carry distance, progressive flags, and under-pressure signals.
+- Persists the original `extra_data` JSON for downstream feature builders.
+
+### 7.4. `load_fact_lineups_from_raw`
+
+- Scans `RawLineup` payloads and resolves the associated `FactMatch`/`DimTeam` rows.
+- Builds/updates `FactLineup` entries for every player in the lineup, inferring starter flags, jersey numbers, positions, substitution times, and minutes played from StatsBomb's positional timelines.
+- Marks processed lineup payloads so late re-ingests can be detected.
 
 ---
 
@@ -265,9 +296,10 @@ This provides a full **Raw → Staging → Fact** path for matches, with dimensi
 - `run_full_ingestion(start_date, end_date, competition_ids)` sets up the Phase 2 pipeline:
   1. `JobIngestMatches` – StatsBomb matches → `RawMatch`.
   2. `JobIngestEvents` – StatsBomb events → `RawEvent`.
-  3. `JobStageMatches` – `RawMatch` → `StgMatch` + mark processed.
-  4. `JobStageEvents` – `RawEvent` → `StgEvent` + mark processed.
-  5. `JobStageEntities` – raw tables → `StgTeam` / `StgPlayer`.
+  3. `JobIngestLineups` – StatsBomb lineups → `RawLineup`.
+  4. `JobStageMatches` – `RawMatch` → `StgMatch` + mark processed.
+  5. `JobStageEvents` – `RawEvent` → `StgEvent` + mark processed.
+  6. `JobStageEntities` – raw tables → `StgTeam` / `StgPlayer`.
 
 You can also run jobs individually for more controlled ETL workflows.
 
@@ -278,18 +310,14 @@ You can also run jobs individually for more controlled ETL workflows.
 Phase 2 implementation is backed by tests:
 
 - **Unit tests:**
-  - `tests/unit/test_statsbomb_client.py` – verifies `StatsBombClient` builds the expected relative URLs and bubbles up `httpx.HTTPStatusError` correctly.
+  - `tests/unit/test_statsbomb_client.py` – verifies the client hits both match and lineup endpoints and surfaces `httpx.HTTPStatusError` cleanly.
+  - `tests/unit/test_pipeline_helpers.py` – covers lineup timing helpers so FactLineup minutes stay accurate.
   - Existing unit tests (`test_api.py`, `test_features.py`, `test_matchup.py`) remain green, ensuring Phase 2 changes don’t break downstream consumers.
 - **Integration test (optional, HTTP):**
   - `tests/integration/test_ingestion_matches_statsbomb.py`:
     - Uses a temporary SQLite DB via `DATABASE_URL`.
     - Runs `JobIngestMatches`, `JobStageMatches`, and `load_fact_matches_from_staging` end‑to‑end.
     - Marked with a skip condition on `SKIP_STATSBOMB_HTTP` so CI doesn’t depend on live GitHub responses.
-
-`pytest -q` currently yields:
-
-- 47 tests passed.
-- 1 integration test skipped by default.
 
 ---
 

@@ -12,10 +12,16 @@ Feature Tables:
 """
 
 import math
-from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+import pandas as pd
+from sqlalchemy import and_, or_, select
+from sqlalchemy.orm import Session
+
+from src.ingestion.schemas import FactMatch, StgEvent, StgMatch
 from src.utils import parse_extra_data
 
 
@@ -59,6 +65,909 @@ class PassType(Enum):
     THROUGH_BALL = 'through_ball'
     CROSS = 'cross'
     SWITCH = 'switch'
+
+
+# ============================================================================
+# FEATURE BUILDER CONFIGURATION
+# ============================================================================
+
+
+@dataclass
+class FeatureBuilderFilters:
+    """Common filtering options for feature builders."""
+
+    source: str = "statsbomb"
+    competition_ids: Optional[List[int]] = None
+    competition_source_ids: Optional[List[str]] = None
+    season_ids: Optional[List[int]] = None
+    season_names: Optional[List[str]] = None
+    match_ids: Optional[List[int]] = None
+    source_match_ids: Optional[List[str]] = None
+    team_ids: Optional[List[int]] = None
+    team_source_ids: Optional[List[str]] = None
+    player_source_ids: Optional[List[str]] = None
+
+
+@dataclass
+class PlayerMatchFeature:
+    """Player skill block metrics for a single match appearance."""
+
+    source: str
+    competition_id: Optional[int]
+    competition_source_id: Optional[str]
+    season_id: Optional[int]
+    season_name: Optional[str]
+    match_id: int
+    team_id: Optional[int]
+    team_source_id: str
+    player_source_id: str
+    minutes_played: float
+    touches: int
+    progressive_carries: int
+    progressive_passes: int
+    progressive_actions_per90: float
+    pass_completion_pct: float
+    dribble_success_pct: float
+    touch_quality: float
+    pressure_actions_per90: float
+    sprints_per90: float
+    tackles_won_per90: float
+    interceptions_per90: float
+    ball_recoveries_per90: float
+    xg: float
+    xa: float
+    xg_xa_per90: float
+    shot_creation_actions: int
+    final_third_entries: int
+    aerial_duel_win_pct: float
+    pressure_regains: int
+
+
+@dataclass
+class TeamMatchFeature:
+    """Team tactic block metrics for a single match."""
+
+    source: str
+    competition_id: Optional[int]
+    competition_source_id: Optional[str]
+    season_id: Optional[int]
+    season_name: Optional[str]
+    match_id: int
+    team_id: Optional[int]
+    team_source_id: str
+    is_home: bool
+    possessions: int
+    ppda: Optional[float]
+    ppda_final_third: Optional[float]
+    high_press_pct: float
+    press_regain_time_sec: Optional[float]
+    press_triggers_per_match: int
+    build_up_pass_share: float
+    gk_short_build_rate: float
+    cb_split_width: Optional[float]
+    pivot_involvement_pct: float
+    vertical_compactness: float
+    line_height_def: float
+    line_height_att: float
+    transition_speed_sec: Optional[float]
+    width_utilization_pct: float
+    cross_rate: float
+    central_overload_rate: float
+    through_ball_rate: float
+    set_piece_xg_share: float
+    passing_network_centralization: float
+    passing_clustering_coeff: Optional[float]
+    passing_asymmetry: float
+    match_outcome: str
+
+
+PROGRESSIVE_DISTANCE_THRESHOLD = 10.0
+FINAL_THIRD_X = 66.67
+DEFENSIVE_THIRD_X = 33.33
+GOAL_KICK_ZONE_X = 6.0
+SPRINT_DISTANCE_THRESHOLD = 15.0
+PRESSURE_REGAIN_WINDOW_SEC = 5.0
+PRESS_TRIGGER_WINDOW_SEC = 10.0
+
+TOUCH_EVENT_TYPES = {'pass', 'carry', 'dribble', 'ball_receipt', 'shot'}
+RECOVERY_EVENT_TYPES = {'ball_recovery', 'interception', 'tackle'}
+DEFENSIVE_ACTION_TYPES = {'tackle', 'interception', 'foul', 'pressure'}
+SET_PIECE_TYPES = {'Free Kick', 'Corner', 'Penalty', 'Throw-in', 'Kick Off'}
+XA_KEYS = ('xa', 'xg_assist', 'shot_assist_xg', 'expected_assist', 'xassist')
+
+
+PLAYER_FEATURE_COLUMNS = [
+    'source',
+    'competition_id',
+    'competition_source_id',
+    'season_id',
+    'season_name',
+    'match_id',
+    'team_id',
+    'team_source_id',
+    'player_source_id',
+    'minutes_played',
+    'touches',
+    'progressive_carries',
+    'progressive_passes',
+    'progressive_actions_per90',
+    'pass_completion_pct',
+    'dribble_success_pct',
+    'touch_quality',
+    'pressure_actions_per90',
+    'sprints_per90',
+    'tackles_won_per90',
+    'interceptions_per90',
+    'ball_recoveries_per90',
+    'xg',
+    'xa',
+    'xg_xa_per90',
+    'shot_creation_actions',
+    'final_third_entries',
+    'aerial_duel_win_pct',
+    'pressure_regains',
+]
+
+
+TEAM_FEATURE_COLUMNS = [
+    'source',
+    'competition_id',
+    'competition_source_id',
+    'season_id',
+    'season_name',
+    'match_id',
+    'team_id',
+    'team_source_id',
+    'is_home',
+    'possessions',
+    'ppda',
+    'ppda_final_third',
+    'high_press_pct',
+    'press_regain_time_sec',
+    'press_triggers_per_match',
+    'build_up_pass_share',
+    'gk_short_build_rate',
+    'cb_split_width',
+    'pivot_involvement_pct',
+    'vertical_compactness',
+    'line_height_def',
+    'line_height_att',
+    'transition_speed_sec',
+    'width_utilization_pct',
+    'cross_rate',
+    'central_overload_rate',
+    'through_ball_rate',
+    'set_piece_xg_share',
+    'passing_network_centralization',
+    'passing_clustering_coeff',
+    'passing_asymmetry',
+    'match_outcome',
+]
+
+
+def _as_list(values: Optional[List[Any]]) -> Optional[List[Any]]:
+    """Normalize optional filters to lists."""
+
+    if values is None:
+        return None
+    if isinstance(values, list):
+        return values
+    return [values]
+
+
+def _safe_rate(numerator: float, denominator: float) -> float:
+    """Return a safe division result."""
+
+    if denominator in (0, None):
+        return 0.0
+    return float(numerator) / float(denominator)
+
+
+def _safe_percent(numerator: float, denominator: float) -> float:
+    """Return percent helper."""
+
+    return _safe_rate(numerator, denominator) * 100
+
+
+def _extract_xg(extra: Dict[str, Any]) -> float:
+    """Extract xG from event extra data."""
+
+    if not extra:
+        return 0.0
+    for key in ('xg', 'statsbomb_xg'):
+        value = extra.get(key)
+        if value is not None:
+            return float(value)
+    return 0.0
+
+
+def _extract_xa(extra: Dict[str, Any]) -> float:
+    """Extract expected assist proxy from pass extra data."""
+
+    if not extra:
+        return 0.0
+    for key in XA_KEYS:
+        value = extra.get(key)
+        if value is not None:
+            return float(value)
+    return 0.0
+
+
+def _is_progressive(start_x: Optional[float], end_x: Optional[float]) -> bool:
+    """Check whether movement is progressive toward goal."""
+
+    if start_x is None or end_x is None:
+        return False
+    progression = end_x - start_x
+    enters_final_third = start_x < FINAL_THIRD_X <= end_x
+    return progression >= PROGRESSIVE_DISTANCE_THRESHOLD or enters_final_third
+
+
+def _is_final_third_entry(start_x: Optional[float], end_x: Optional[float]) -> bool:
+    """Check if action enters the final third."""
+
+    if start_x is None or end_x is None:
+        return False
+    return start_x < FINAL_THIRD_X and end_x >= FINAL_THIRD_X
+
+
+def _ensure_event_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure helper columns exist for downstream calculations."""
+
+    if df.empty:
+        return df
+
+    result = df.copy()
+    if 'extra_data' in result.columns:
+        result['extra_data'] = result['extra_data'].apply(parse_extra_data)
+    else:
+        result['extra_data'] = [{} for _ in range(len(result))]
+
+    if 'event_time_sec' not in result.columns:
+        minute = result.get('minute', pd.Series([0] * len(result)))
+        second = result.get('second', pd.Series([0] * len(result)))
+        result['event_time_sec'] = minute.fillna(0) * 60 + second.fillna(0)
+
+    if 'is_successful' not in result.columns:
+        result['is_successful'] = False
+
+    needed = ['team_id', 'is_home', 'home_score', 'away_score', 'competition_source_id', 'season_name']
+    for column in needed:
+        if column not in result.columns:
+            result[column] = None
+
+    return result
+
+
+def _estimate_minutes_played(events: pd.DataFrame) -> float:
+    """Approximate minutes played based on event timestamps."""
+
+    if events.empty or events['minute'].isnull().all():
+        return 0.0
+
+    min_minute = events['minute'].min() or 0
+    max_minute = events['minute'].max() or 0
+    min_second = events['second'].fillna(0).min() if 'second' in events else 0
+    max_second = events['second'].fillna(0).max() if 'second' in events else 0
+    duration_seconds = (max_minute * 60 + max_second) - (min_minute * 60 + min_second)
+    if duration_seconds <= 0:
+        duration_seconds = (max_minute + 1) * 60
+    minutes = duration_seconds / 60
+    return float(min(120.0, max(minutes, 1.0)))
+
+
+def _flag_pressure_regains(events: pd.DataFrame, window_seconds: float = PRESSURE_REGAIN_WINDOW_SEC) -> pd.DataFrame:
+    """Annotate pressure events that lead to regains within the provided window."""
+
+    if events.empty:
+        df = events.copy()
+        df['pressure_led_to_regain'] = False
+        return df
+
+    df = events.sort_values(['match_id', 'team_source_id', 'event_time_sec']).copy()
+    df['pressure_led_to_regain'] = False
+
+    groups = df.groupby(['match_id', 'team_source_id'])
+    for (_, _), idx in groups.groups.items():
+        group = df.loc[idx]
+        recovery_times = group[group['event_type'].isin(RECOVERY_EVENT_TYPES)]['event_time_sec'].to_numpy()
+        if recovery_times.size == 0:
+            continue
+        pressures = group[group['event_type'] == 'pressure']
+        if pressures.empty:
+            continue
+        for row_idx, row in pressures.iterrows():
+            time = row['event_time_sec']
+            pos = recovery_times.searchsorted(time, side='right')
+            if pos < recovery_times.size and recovery_times[pos] - time <= window_seconds:
+                df.at[row_idx, 'pressure_led_to_regain'] = True
+
+    return df
+
+
+def _fetch_event_dataframe(session: Session, filters: FeatureBuilderFilters) -> pd.DataFrame:
+    """Load staged events with match metadata for a builder request."""
+
+    filters = filters or FeatureBuilderFilters()
+    comp_ids = _as_list(filters.competition_ids)
+    comp_sources = _as_list(filters.competition_source_ids)
+    season_ids = _as_list(filters.season_ids)
+    season_names = _as_list(filters.season_names)
+    match_ids = _as_list(filters.match_ids)
+    source_match_ids = _as_list(filters.source_match_ids)
+    team_ids = _as_list(filters.team_ids)
+    team_sources = _as_list(filters.team_source_ids)
+    player_sources = _as_list(filters.player_source_ids)
+
+    stmt = (
+        select(
+            StgEvent.source,
+            StgEvent.source_match_id,
+            StgEvent.team_source_id,
+            StgEvent.player_source_id,
+            StgEvent.event_type,
+            StgEvent.event_subtype,
+            StgEvent.minute,
+            StgEvent.second,
+            StgEvent.period,
+            StgEvent.location_x,
+            StgEvent.location_y,
+            StgEvent.end_location_x,
+            StgEvent.end_location_y,
+            StgEvent.outcome,
+            StgEvent.is_successful,
+            StgEvent.extra_data,
+            StgMatch.competition_source_id,
+            StgMatch.season_name,
+            StgMatch.home_team_source_id,
+            StgMatch.away_team_source_id,
+            FactMatch.match_id,
+            FactMatch.competition_id,
+            FactMatch.season_id,
+            FactMatch.home_team_id,
+            FactMatch.away_team_id,
+            FactMatch.home_score,
+            FactMatch.away_score,
+        )
+        .join(
+            StgMatch,
+            and_(
+                StgMatch.source == StgEvent.source,
+                StgMatch.source_match_id == StgEvent.source_match_id,
+            ),
+        )
+        .outerjoin(
+            FactMatch,
+            and_(
+                FactMatch.source == StgEvent.source,
+                FactMatch.source_match_id == StgEvent.source_match_id,
+            ),
+        )
+        .where(StgEvent.source == filters.source)
+    )
+
+    if match_ids:
+        stmt = stmt.where(FactMatch.match_id.in_(match_ids))
+    if source_match_ids:
+        stmt = stmt.where(StgEvent.source_match_id.in_(source_match_ids))
+    if comp_ids:
+        stmt = stmt.where(FactMatch.competition_id.in_(comp_ids))
+    if comp_sources:
+        stmt = stmt.where(StgMatch.competition_source_id.in_(comp_sources))
+    if season_ids:
+        stmt = stmt.where(FactMatch.season_id.in_(season_ids))
+    if season_names:
+        stmt = stmt.where(StgMatch.season_name.in_(season_names))
+    if team_sources:
+        stmt = stmt.where(StgEvent.team_source_id.in_(team_sources))
+    if team_ids:
+        stmt = stmt.where(or_(FactMatch.home_team_id.in_(team_ids), FactMatch.away_team_id.in_(team_ids)))
+
+    result = session.execute(stmt).mappings().all()
+    if not result:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(result)
+    df = df[df['match_id'].notnull()].copy()
+    if df.empty:
+        return df
+
+    df['minute'] = df['minute'].fillna(0)
+    df['second'] = df['second'].fillna(0)
+    df['event_time_sec'] = df['minute'] * 60 + df['second']
+    df['extra_data'] = df['extra_data'].apply(parse_extra_data)
+    df['is_successful'] = df['is_successful'].fillna(False)
+    df['team_id'] = np.where(
+        df['team_source_id'] == df['home_team_source_id'],
+        df['home_team_id'],
+        np.where(df['team_source_id'] == df['away_team_source_id'], df['away_team_id'], None),
+    )
+    df['is_home'] = df['team_source_id'] == df['home_team_source_id']
+
+    if team_ids:
+        df = df[df['team_id'].isin(team_ids)]
+    if player_sources:
+        df = df[df['player_source_id'].isin(player_sources)]
+
+    return df.reset_index(drop=True)
+
+
+def _count_shot_creation_actions(passes: pd.DataFrame, dribbles: pd.DataFrame) -> int:
+    """Approximate shot-creating actions using key pass proxies and final-third dribbles."""
+
+    if passes.empty and dribbles.empty:
+        return 0
+
+    pass_mask = (
+        (passes['end_location_x'] >= FINAL_THIRD_X)
+        | (passes['extra_data'].apply(lambda d: bool(d.get('through_ball') or d.get('cross') or d.get('switch'))))
+    )
+    key_passes = passes[pass_mask]
+
+    successful_dribbles = dribbles[dribbles['is_successful'].fillna(False)]
+    final_third_dribbles = successful_dribbles[successful_dribbles['location_x'] >= FINAL_THIRD_X]
+
+    return int(len(key_passes) + len(final_third_dribbles))
+
+
+def _count_final_third_entries(passes: pd.DataFrame, carries: pd.DataFrame) -> int:
+    """Count actions that progress from outside to inside the final third."""
+
+    if passes.empty and carries.empty:
+        return 0
+
+    pass_entries = passes[
+        (passes['location_x'] < FINAL_THIRD_X)
+        & (passes['end_location_x'] >= FINAL_THIRD_X)
+    ]
+    carry_entries = carries[
+        (carries['location_x'] < FINAL_THIRD_X)
+        & (carries['end_location_x'] >= FINAL_THIRD_X)
+    ]
+
+    return int(len(pass_entries) + len(carry_entries))
+
+
+def _count_sprints(carries: pd.DataFrame) -> int:
+    """Approximate sprints as carries that cover long distances."""
+
+    if carries.empty:
+        return 0
+    return int(
+        carries['extra_data'].apply(lambda d: d.get('carry_distance', 0) >= SPRINT_DISTANCE_THRESHOLD).sum()
+    )
+
+
+def _calculate_player_group_metrics(group: pd.DataFrame) -> Dict[str, Any]:
+    """Compute player-level metrics for a single match."""
+
+    minutes = _estimate_minutes_played(group)
+    per_90 = 90.0 / minutes if minutes else 0.0
+
+    passes = group[group['event_type'] == 'pass']
+    carries = group[group['event_type'] == 'carry']
+    dribbles = group[group['event_type'] == 'dribble']
+    shots = group[group['event_type'] == 'shot']
+    pressures = group[group['event_type'] == 'pressure']
+
+    touch_mask = group['event_type'].isin(TOUCH_EVENT_TYPES)
+    touches = int(touch_mask.sum())
+
+    pass_attempts = len(passes)
+    completed_passes = int(passes['is_successful'].sum())
+    pass_completion_pct = _safe_percent(completed_passes, pass_attempts)
+
+    prog_pass_mask = (
+        (passes['end_location_x'].fillna(passes['location_x']) - passes['location_x'].fillna(passes['end_location_x']) >= PROGRESSIVE_DISTANCE_THRESHOLD)
+        | ((passes['location_x'] < FINAL_THIRD_X) & (passes['end_location_x'] >= FINAL_THIRD_X))
+    )
+    progressive_passes = int(prog_pass_mask.sum())
+
+    prog_carry_mask = (
+        (carries['end_location_x'].fillna(carries['location_x']) - carries['location_x'].fillna(carries['end_location_x']) >= PROGRESSIVE_DISTANCE_THRESHOLD)
+        | ((carries['location_x'] < FINAL_THIRD_X) & (carries['end_location_x'] >= FINAL_THIRD_X))
+    )
+    progressive_carries = int(prog_carry_mask.sum())
+
+    dribble_success = int(dribbles['is_successful'].sum())
+    dribble_success_pct = _safe_percent(dribble_success, len(dribbles))
+
+    dispossessions = int(group[group['event_type'] == 'miscontrol'].shape[0] + (len(dribbles) - dribble_success))
+    touch_quality = _safe_rate(dispossessions, touches)
+
+    sprints = _count_sprints(carries)
+
+    tackles = group[group['event_type'] == 'tackle']
+    duels = group[group['event_type'] == 'duel']
+    if not duels.empty:
+        duel_subtypes = duels['event_subtype'].fillna('').astype(str)
+        duel_tackle_mask = duel_subtypes.str.contains('tackle', case=False)
+        aerial_mask = duel_subtypes.str.contains('aerial', case=False)
+        duel_tackles = duels[duel_tackle_mask]
+        aerials = duels[aerial_mask]
+    else:
+        duel_tackles = duels
+        aerials = duels
+    tackles_won = int(tackles['is_successful'].sum() + duel_tackles['is_successful'].sum())
+
+    interceptions = int(group[group['event_type'] == 'interception'].shape[0])
+    recoveries = int(group[group['event_type'] == 'ball_recovery'].shape[0])
+
+    xg = float(shots['extra_data'].apply(_extract_xg).sum())
+    xa = float(passes['extra_data'].apply(_extract_xa).sum())
+
+    sca = _count_shot_creation_actions(passes, dribbles)
+    final_third_entries = _count_final_third_entries(passes, carries)
+
+    aerial_wins = int(aerials['is_successful'].sum()) if not aerials.empty else 0
+    aerial_win_pct = _safe_percent(aerial_wins, len(aerials)) if not aerials.empty else 0.0
+
+    pressure_regains = int(group[(group['event_type'] == 'pressure') & group['pressure_led_to_regain']].shape[0])
+
+    return {
+        'minutes_played': minutes,
+        'touches': touches,
+        'progressive_carries': progressive_carries,
+        'progressive_passes': progressive_passes,
+        'progressive_actions_per90': (progressive_carries + progressive_passes) * per_90,
+        'pass_completion_pct': pass_completion_pct,
+        'dribble_success_pct': dribble_success_pct,
+        'touch_quality': touch_quality,
+        'pressure_actions_per90': len(pressures) * per_90,
+        'sprints_per90': sprints * per_90,
+        'tackles_won_per90': tackles_won * per_90,
+        'interceptions_per90': interceptions * per_90,
+        'ball_recoveries_per90': recoveries * per_90,
+        'xg': xg,
+        'xa': xa,
+        'xg_xa_per90': (xg + xa) * per_90,
+        'shot_creation_actions': sca,
+        'final_third_entries': final_third_entries,
+        'aerial_duel_win_pct': aerial_win_pct,
+        'pressure_regains': pressure_regains,
+    }
+
+
+def compute_player_match_features_from_events(events_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute player-level match features from a prepared event DataFrame."""
+
+    if events_df is None or events_df.empty:
+        return pd.DataFrame(columns=PLAYER_FEATURE_COLUMNS)
+
+    df = _ensure_event_columns(events_df)
+    df = df[df['player_source_id'].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=PLAYER_FEATURE_COLUMNS)
+
+    if 'pressure_led_to_regain' not in df.columns:
+        df = _flag_pressure_regains(df)
+
+    rows: List[Dict[str, Any]] = []
+    for (match_id, team_source_id, player_source_id), group in df.groupby(['match_id', 'team_source_id', 'player_source_id']):
+        metrics = _calculate_player_group_metrics(group)
+        row = group.iloc[0]
+        payload = {
+            'source': row.get('source'),
+            'competition_id': row.get('competition_id'),
+            'competition_source_id': row.get('competition_source_id'),
+            'season_id': row.get('season_id'),
+            'season_name': row.get('season_name'),
+            'match_id': match_id,
+            'team_id': row.get('team_id'),
+            'team_source_id': team_source_id,
+            'player_source_id': player_source_id,
+        }
+        payload.update(metrics)
+        rows.append(payload)
+
+    return pd.DataFrame(rows, columns=PLAYER_FEATURE_COLUMNS)
+
+
+def build_player_match_features(session: Session,
+                                filters: Optional[FeatureBuilderFilters] = None) -> pd.DataFrame:
+    """Run the PlayerMatchFeature builder against the SQLAlchemy session."""
+
+    filters = filters or FeatureBuilderFilters()
+    events_df = _fetch_event_dataframe(session, filters)
+    return compute_player_match_features_from_events(events_df)
+
+
+def _compute_ppda(opponent_events: pd.DataFrame, team_events: pd.DataFrame,
+                  zone_threshold: float) -> Optional[float]:
+    """Compute passes per defensive action in a specified zone."""
+
+    opponent_passes = opponent_events[
+        (opponent_events['event_type'] == 'pass')
+        & (opponent_events['location_x'] >= zone_threshold)
+    ]
+    defensive_actions = team_events[
+        team_events['event_type'].isin(DEFENSIVE_ACTION_TYPES)
+        & (team_events['location_x'] >= zone_threshold)
+    ]
+
+    if defensive_actions.empty:
+        return None
+
+    return float(opponent_passes.shape[0] / defensive_actions.shape[0])
+
+
+def _compute_press_regain_time(team_events: pd.DataFrame) -> Optional[float]:
+    """Average seconds from losing the ball to regaining possession."""
+
+    loss_mask = (
+        ((team_events['event_type'] == 'pass') | (team_events['event_type'] == 'dribble'))
+        & (~team_events['is_successful'].fillna(True))
+    ) | (team_events['event_type'] == 'miscontrol')
+    losses = team_events[loss_mask]
+    recoveries = team_events[team_events['event_type'].isin(RECOVERY_EVENT_TYPES)]
+
+    if losses.empty or recoveries.empty:
+        return None
+
+    recovery_times = recoveries['event_time_sec'].sort_values().to_numpy()
+    deltas: List[float] = []
+    for loss_time in losses['event_time_sec']:
+        idx = recovery_times.searchsorted(loss_time, side='right')
+        if idx < recovery_times.size:
+            deltas.append(recovery_times[idx] - loss_time)
+    return float(np.mean(deltas)) if deltas else None
+
+
+def _count_press_triggers_for_group(pressures: pd.DataFrame) -> int:
+    """Count sequences of three pressures within the configured window."""
+
+    if pressures.empty:
+        return 0
+
+    times = pressures['event_time_sec'].sort_values().to_numpy()
+    if times.size < 3:
+        return 0
+
+    triggers = 0
+    for idx in range(times.size - 2):
+        if times[idx + 2] - times[idx] <= PRESS_TRIGGER_WINDOW_SEC:
+            triggers += 1
+    return triggers
+
+
+def _compute_transition_speed(team_events: pd.DataFrame) -> Optional[float]:
+    """Average seconds from recovery to reaching the final third or shooting."""
+
+    recoveries = team_events[team_events['event_type'].isin(RECOVERY_EVENT_TYPES)]
+    if recoveries.empty:
+        return None
+
+    recovery_times = recoveries['event_time_sec'].sort_values().to_numpy()
+
+    pass_entries = (
+        (team_events['event_type'] == 'pass')
+        & (team_events['location_x'] < FINAL_THIRD_X)
+        & (team_events['end_location_x'] >= FINAL_THIRD_X)
+    )
+    carry_entries = (
+        (team_events['event_type'] == 'carry')
+        & (team_events['location_x'] < FINAL_THIRD_X)
+        & (team_events['end_location_x'] >= FINAL_THIRD_X)
+    )
+    shot_entries = (
+        (team_events['event_type'] == 'shot')
+        & (team_events['location_x'] >= FINAL_THIRD_X)
+    )
+
+    entries = team_events[pass_entries | carry_entries | shot_entries]
+    if entries.empty:
+        return None
+
+    entry_times = entries['event_time_sec'].sort_values().to_numpy()
+    deltas: List[float] = []
+    for rec_time in recovery_times:
+        idx = entry_times.searchsorted(rec_time, side='right')
+        if idx < entry_times.size:
+            deltas.append(entry_times[idx] - rec_time)
+    return float(np.mean(deltas)) if deltas else None
+
+
+def _compute_cb_split_width(passes: pd.DataFrame) -> Optional[float]:
+    """Estimate center-back split width using passes near the box."""
+
+    deep_passes = passes[passes['location_x'] <= DEFENSIVE_THIRD_X]
+    y_values = deep_passes['location_y'].dropna()
+    if y_values.empty:
+        return None
+    return float(np.percentile(y_values, 90) - np.percentile(y_values, 10))
+
+
+def _compute_passing_centralization(passes: pd.DataFrame) -> float:
+    """Degree centralization based on pass counts per player."""
+
+    if passes.empty or passes['player_source_id'].isnull().all():
+        return 0.0
+
+    counts = passes.groupby('player_source_id').size()
+    if counts.size < 2:
+        return 0.0
+
+    max_passes = counts.max()
+    if max_passes == 0:
+        return 0.0
+
+    sum_diff = (max_passes - counts).sum()
+    denom = (counts.size - 1) * max_passes
+    return float(sum_diff / denom) if denom else 0.0
+
+
+def _compute_passing_clustering(passes: pd.DataFrame) -> Optional[float]:
+    """Proxy clustering coefficient using lateral spread of passes."""
+
+    y_values = passes['location_y'].dropna()
+    if y_values.size < 2:
+        return None
+    std_y = float(y_values.std())
+    return float(max(0.0, 1.0 - min(std_y / 50.0, 1.0)))
+
+
+def _determine_match_outcome(row: pd.Series) -> str:
+    """Return W/D/L given team context and scoreline."""
+
+    home_score = row.get('home_score') or 0
+    away_score = row.get('away_score') or 0
+    is_home = bool(row.get('is_home'))
+    team_score = home_score if is_home else away_score
+    opp_score = away_score if is_home else home_score
+    if team_score > opp_score:
+        return 'W'
+    if team_score == opp_score:
+        return 'D'
+    return 'L'
+
+
+def _compute_team_metrics(team_events: pd.DataFrame,
+                          opponent_events: pd.DataFrame) -> Dict[str, Any]:
+    """Calculate tactic block metrics for a team in a match."""
+
+    passes = team_events[team_events['event_type'] == 'pass']
+    carries = team_events[team_events['event_type'] == 'carry']
+    pressures = team_events[team_events['event_type'] == 'pressure']
+    shots = team_events[team_events['event_type'] == 'shot']
+    touches = team_events[team_events['event_type'].isin(TOUCH_EVENT_TYPES.union({'ball_receipt'}))]
+    recoveries = team_events[team_events['event_type'].isin(RECOVERY_EVENT_TYPES)]
+
+    possessions = int(recoveries.shape[0])
+    if possessions == 0:
+        possessions = max(1, passes.shape[0] // 4 or 1)
+
+    ppda = _compute_ppda(opponent_events, team_events, 50.0)
+    ppda_final = _compute_ppda(opponent_events, team_events, FINAL_THIRD_X)
+    high_press_pct = _safe_percent(len(pressures[pressures['location_x'] >= FINAL_THIRD_X]), len(pressures))
+    press_regain = _compute_press_regain_time(team_events)
+    press_triggers = _count_press_triggers_for_group(pressures)
+
+    build_up_passes = passes[
+        (passes['location_x'] <= DEFENSIVE_THIRD_X)
+        & (passes['end_location_x'] >= 50)
+    ]
+    build_up_share = _safe_percent(len(build_up_passes), len(passes))
+
+    gk_passes = passes[passes['location_x'] <= GOAL_KICK_ZONE_X]
+    gk_short = gk_passes[gk_passes['extra_data'].apply(lambda d: d.get('pass_length', 0) <= 25)]
+    gk_short_rate = _safe_percent(len(gk_short), len(gk_passes)) if not gk_passes.empty else 0.0
+
+    cb_split = _compute_cb_split_width(passes)
+
+    pivot_touches = touches[
+        touches['location_x'].between(35, 55, inclusive='both')
+        & touches['location_y'].between(30, 70, inclusive='both')
+    ]
+    pivot_pct = _safe_percent(len(pivot_touches), len(touches))
+
+    defensive_line_events = team_events[team_events['event_type'].isin({'tackle', 'interception', 'clearance', 'block'})]
+    def_height = float(defensive_line_events['location_x'].dropna().mean()) if not defensive_line_events['location_x'].dropna().empty else 0.0
+    attacking_events = team_events[team_events['event_type'].isin({'pass', 'carry', 'dribble', 'shot'})]
+    att_height = float(attacking_events['location_x'].dropna().mean()) if not attacking_events['location_x'].dropna().empty else 0.0
+    vertical_compactness = att_height - def_height
+
+    transition_speed = _compute_transition_speed(team_events)
+
+    wide_passes = passes[(passes['location_y'] <= 15) | (passes['location_y'] >= 85)]
+    width_pct = _safe_percent(len(wide_passes), len(passes))
+
+    denom_possessions = max(1, possessions)
+    crosses = passes[passes['extra_data'].apply(lambda d: bool(d.get('cross')))]
+    cross_rate = len(crosses) / denom_possessions
+    central_passes = passes[passes['location_y'].between(35, 65, inclusive='both')]
+    central_overload = len(central_passes) / denom_possessions
+    through_balls = passes[passes['extra_data'].apply(lambda d: bool(d.get('through_ball')))]
+    through_rate = len(through_balls) / denom_possessions
+
+    if not shots.empty and 'extra_data' in shots:
+        shot_extra = shots['extra_data']
+    else:
+        shot_extra = pd.Series(dtype=object)
+
+    total_xg = float(shot_extra.apply(_extract_xg).sum()) if not shot_extra.empty else 0.0
+    set_piece_mask = shot_extra.apply(
+        lambda d: d.get('type') in SET_PIECE_TYPES if isinstance(d, dict) else False
+    ) if not shot_extra.empty else pd.Series(dtype=bool)
+    set_piece_xg = float(shot_extra[set_piece_mask].apply(_extract_xg).sum()) if not shot_extra.empty else 0.0
+    set_piece_share = _safe_rate(set_piece_xg, total_xg) if total_xg else 0.0
+
+    centralization = _compute_passing_centralization(passes)
+    clustering = _compute_passing_clustering(passes)
+
+    left_passes = passes[passes['location_y'] < 50].shape[0]
+    right_passes = passes[passes['location_y'] > 50].shape[0]
+    asymmetry = _safe_rate(left_passes - right_passes, len(passes))
+
+    return {
+        'possessions': possessions,
+        'ppda': ppda,
+        'ppda_final_third': ppda_final,
+        'high_press_pct': high_press_pct,
+        'press_regain_time_sec': press_regain,
+        'press_triggers_per_match': press_triggers,
+        'build_up_pass_share': build_up_share,
+        'gk_short_build_rate': gk_short_rate,
+        'cb_split_width': cb_split,
+        'pivot_involvement_pct': pivot_pct,
+        'vertical_compactness': vertical_compactness,
+        'line_height_def': def_height,
+        'line_height_att': att_height,
+        'transition_speed_sec': transition_speed,
+        'width_utilization_pct': width_pct,
+        'cross_rate': cross_rate,
+        'central_overload_rate': central_overload,
+        'through_ball_rate': through_rate,
+        'set_piece_xg_share': set_piece_share,
+        'passing_network_centralization': centralization,
+        'passing_clustering_coeff': clustering,
+        'passing_asymmetry': asymmetry,
+    }
+
+
+def compute_team_match_features_from_events(events_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute team tactic block metrics from an events DataFrame."""
+
+    if events_df is None or events_df.empty:
+        return pd.DataFrame(columns=TEAM_FEATURE_COLUMNS)
+
+    df = _ensure_event_columns(events_df)
+    df = df[df['team_source_id'].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=TEAM_FEATURE_COLUMNS)
+
+    match_groups = {mid: grp for mid, grp in df.groupby('match_id')}
+    rows: List[Dict[str, Any]] = []
+
+    for (match_id, team_source_id), team_group in df.groupby(['match_id', 'team_source_id']):
+        opponent_group = match_groups.get(match_id, pd.DataFrame())
+        opponent_group = opponent_group[opponent_group['team_source_id'] != team_source_id]
+        metrics = _compute_team_metrics(team_group, opponent_group)
+        row = team_group.iloc[0]
+        payload = {
+            'source': row.get('source'),
+            'competition_id': row.get('competition_id'),
+            'competition_source_id': row.get('competition_source_id'),
+            'season_id': row.get('season_id'),
+            'season_name': row.get('season_name'),
+            'match_id': match_id,
+            'team_id': row.get('team_id'),
+            'team_source_id': team_source_id,
+            'is_home': bool(row.get('is_home', False)),
+            'match_outcome': _determine_match_outcome(row),
+        }
+        payload.update(metrics)
+        rows.append(payload)
+
+    return pd.DataFrame(rows, columns=TEAM_FEATURE_COLUMNS)
+
+
+def build_team_match_features(session: Session,
+                              filters: Optional[FeatureBuilderFilters] = None) -> pd.DataFrame:
+    """Run TeamMatchFeature builder using staged events."""
+
+    filters = filters or FeatureBuilderFilters()
+    events_df = _fetch_event_dataframe(session, filters)
+    return compute_team_match_features_from_events(events_df)
 
 
 # ============================================================================

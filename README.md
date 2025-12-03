@@ -47,6 +47,23 @@ Football has evolved dramatically over the past two decades. This project uses s
                         │  FastAPI        │
                         │  REST API       │
                         └─────────────────┘
+
+## 🧱 Ingestion Pipeline
+
+StatsBomb Open is the primary Phase 2 data source. The ETL stack in `src/ingestion/pipeline.py` currently wires up the following jobs and helpers:
+
+1. `JobIngestMatches` – pulls competition/season match lists into `raw_match`.
+2. `JobIngestEvents` – fetches per-match event JSON into `raw_event`.
+3. `JobIngestLineups` – captures both team lineups for each match into `raw_lineup`.
+4. `JobStageMatches` – normalizes match metadata (team & competition names, matchweek, stage, attendance) into `stg_match`.
+5. `JobStageEvents` – standardizes locations, subtypes, outcomes, and derived flags (`progressive`, `under_pressure`, etc.) into `stg_event`.
+6. `JobStageEntities` – produces `stg_team`/`stg_player` reference data using match, event, and lineup payloads.
+7. Fact loaders:
+   - `load_fact_matches_from_staging`
+   - `load_fact_events_from_staging`
+   - `load_fact_lineups_from_raw`
+
+Run them individually or via `Pipeline.run_full_ingestion`, which strings jobs (1)–(6) together before fact materialization. Lineups and enriched event metadata ensure player dimensions and FactLineup rows stay in sync with StatsBomb IDs.
 ```
 
 ## 📁 Project Structure

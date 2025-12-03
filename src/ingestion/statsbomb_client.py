@@ -100,3 +100,28 @@ class StatsBombClient:
 
         return data
 
+    def get_lineups(self, match_id: int) -> List[Dict[str, Any]]:
+        """Return lineup payload for a given match from GitHub.
+
+        StatsBomb Open stores lineup files at::
+
+            data/lineups/{match_id}.json
+
+        The relative path may be overridden with ``STATSBOMB_LINEUPS_PATH``.
+        """
+
+        path_template = os.getenv(
+            "STATSBOMB_LINEUPS_PATH",
+            "lineups/{match_id}.json",
+        )
+        path = path_template.format(match_id=match_id)
+
+        resp = self._client.get(path)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not isinstance(data, list):
+            raise ValueError("Expected list of lineups from StatsBomb Open data")
+
+        return data
+

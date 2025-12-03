@@ -11,10 +11,11 @@ This module provides the core ETL jobs for:
 import json
 import logging
 from abc import ABC, abstractmethod
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from datetime import datetime, date
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.ingestion.db import get_session
@@ -27,11 +28,15 @@ from src.ingestion.schemas import (
     StgTeam,
     StgPlayer,
     FactMatch,
+    FactEvent,
+    FactLineup,
     DimCompetition,
     DimSeason,
     DimTeam,
+    DimPlayer,
 )
 from src.ingestion.statsbomb_client import StatsBombClient
+from src.utils import parse_extra_data
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -365,6 +370,141 @@ class JobIngestEvents(BaseETLJob):
         return loaded_count
 
 
+class JobIngestLineups(BaseETLJob):
+    """Job: job_ingest_lineups
+
+    Purpose: Fetch lineup data for matches and load to ``raw_lineup``.
+
+    Steps:
+    1. Determine matches needing lineup ingestion
+    2. Fetch lineups for each match from source API
+    3. Store per-team lineup payloads with metadata
+    4. Reset ``processed`` flag for refreshed records
+    """
+
+    def __init__(self, config: PipelineConfig, match_ids: Optional[List[str]] = None):
+        super().__init__(config)
+        self.match_ids = match_ids
+
+    def extract(self) -> List[Dict[str, Any]]:
+        if self.config.source != "statsbomb":
+            self.logger.warning("JobIngestLineups currently only implements statsbomb source")
+            return []
+
+        match_ids = self.match_ids or self._get_matches_missing_lineups()
+        if not match_ids:
+            self.logger.info("No matches needing lineup ingestion")
+            return []
+
+        client = StatsBombClient()
+        payloads: List[Dict[str, Any]] = []
+        try:
+            for match_id in match_ids:
+                self.logger.info(f"Fetching lineups for match {match_id}")
+                try:
+                    lineups = client.get_lineups(int(match_id))
+                except Exception as exc:
+                    self.logger.error(f"Failed to fetch lineups for match {match_id}: {exc}")
+                    continue
+
+                payloads.append({
+                    "match_id": str(match_id),
+                    "lineups": lineups,
+                })
+        finally:
+            client.close()
+
+        return payloads
+
+    def _get_matches_missing_lineups(self) -> List[str]:
+        with get_session() as session:
+            matches: List[RawMatch] = (
+                session.query(RawMatch)
+                .filter(RawMatch.source == self.config.source)
+                .all()
+            )
+            if not matches:
+                return []
+
+            existing_counts = {
+                match_id: count
+                for match_id, count in (
+                    session.query(RawLineup.source_match_id, func.count(RawLineup.id))
+                    .filter(RawLineup.source == self.config.source)
+                    .group_by(RawLineup.source_match_id)
+                    .all()
+                )
+            }
+
+            pending: List[str] = []
+            for match in matches:
+                match_id = str(match.source_match_id)
+                if existing_counts.get(match_id, 0) < 2:
+                    pending.append(match_id)
+
+            return pending
+
+    def transform(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        transformed: List[Dict[str, Any]] = []
+        for record in data:
+            match_id = record["match_id"]
+            for team_payload in record.get("lineups", []):
+                team_id = team_payload.get("team_id")
+                if team_id is None:
+                    continue
+                transformed.append({
+                    "source": self.config.source,
+                    "source_match_id": match_id,
+                    "source_team_id": str(team_id),
+                    "raw_json": json.dumps(team_payload),
+                    "ingested_at": datetime.utcnow().isoformat(),
+                    "processed": False,
+                })
+
+        return transformed
+
+    def load(self, data: List[Dict[str, Any]]) -> int:
+        if not data:
+            return 0
+
+        loaded_count = 0
+        with get_session() as session:
+            for record in data:
+                match_id = record["source_match_id"]
+                team_id = record["source_team_id"]
+                payload = json.loads(record["raw_json"])
+
+                existing = (
+                    session.query(RawLineup)
+                    .filter(
+                        RawLineup.source == self.config.source,
+                        RawLineup.source_match_id == match_id,
+                        RawLineup.source_team_id == team_id,
+                    )
+                    .one_or_none()
+                )
+
+                if existing:
+                    existing.raw_json = payload
+                    existing.ingested_at = datetime.utcnow()
+                    existing.processed = False
+                else:
+                    session.add(
+                        RawLineup(
+                            source=self.config.source,
+                            source_match_id=match_id,
+                            source_team_id=team_id,
+                            raw_json=payload,
+                            ingested_at=datetime.utcnow(),
+                            processed=False,
+                        )
+                    )
+
+                loaded_count += 1
+
+        return loaded_count
+
+
 # ============================================================================
 # STAGING JOBS - Transform raw data to staging layer
 # ============================================================================
@@ -421,10 +561,12 @@ class JobStageMatches(BaseETLJob):
 
         for raw in data:
             try:
-                match_json = json.loads(raw['raw_json'])
+                # ``raw['raw_json']`` is already a dict from the JSON column
+                match_json = raw['raw_json']
                 staged = self._parse_match(match_json, raw['source'])
                 staged['source'] = raw['source']
                 staged['source_match_id'] = raw['source_match_id']
+                staged['match_date'] = self._coerce_match_date(staged.get('match_date'))
                 transformed.append(staged)
             except Exception as e:
                 self.logger.error(f"Failed to parse match {raw['source_match_id']}: {e}")
@@ -446,18 +588,30 @@ class JobStageMatches(BaseETLJob):
 
     def _parse_statsbomb_match(self, match: Dict) -> Dict[str, Any]:
         """Parse StatsBomb match format."""
+        home_team = match.get('home_team', {}) or {}
+        away_team = match.get('away_team', {}) or {}
+        competition = match.get('competition', {}) or {}
+        competition_stage = match.get('competition_stage', {}) or {}
+        stadium = match.get('stadium', {}) or {}
+        referee = match.get('referee', {}) or {}
+
         return {
-            'home_team_source_id': str(match.get('home_team', {}).get('home_team_id')),
-            'away_team_source_id': str(match.get('away_team', {}).get('away_team_id')),
-            'competition_source_id': str(match.get('competition', {}).get('competition_id')),
+            'home_team_source_id': str(home_team.get('home_team_id')),
+            'home_team_name': home_team.get('home_team_name'),
+            'away_team_source_id': str(away_team.get('away_team_id')),
+            'away_team_name': away_team.get('away_team_name'),
+            'competition_source_id': str(competition.get('competition_id')),
+            'competition_name': competition.get('competition_name'),
             'season_name': match.get('season', {}).get('season_name'),
             'match_date': match.get('match_date'),
             'match_time': match.get('kick_off'),
+            'match_week': match.get('match_week'),
             'home_score': match.get('home_score'),
             'away_score': match.get('away_score'),
             'status': 'finished' if match.get('match_status') == 'available' else 'scheduled',
-            'stadium': match.get('stadium', {}).get('name'),
-            'referee': match.get('referee', {}).get('name'),
+            'competition_stage': competition_stage.get('name'),
+            'stadium': stadium.get('name'),
+            'referee': referee.get('name'),
             'attendance': match.get('attendance')
         }
 
@@ -465,14 +619,19 @@ class JobStageMatches(BaseETLJob):
         """Parse Wyscout match format."""
         return {
             'home_team_source_id': str(match.get('home_team_id')),
+            'home_team_name': match.get('home_team_name'),
             'away_team_source_id': str(match.get('away_team_id')),
+            'away_team_name': match.get('away_team_name'),
             'competition_source_id': str(match.get('competition_id')),
+            'competition_name': match.get('competition_name'),
             'season_name': match.get('season'),
             'match_date': match.get('date'),
             'match_time': match.get('time'),
+            'match_week': match.get('match_week'),
             'home_score': match.get('home_score'),
             'away_score': match.get('away_score'),
             'status': match.get('status', 'unknown'),
+            'competition_stage': match.get('competition_stage'),
             'stadium': match.get('venue'),
             'referee': match.get('referee'),
             'attendance': match.get('attendance')
@@ -482,18 +641,37 @@ class JobStageMatches(BaseETLJob):
         """Parse generic match format."""
         return {
             'home_team_source_id': str(match.get('home_team_id', '')),
+            'home_team_name': match.get('home_team_name'),
             'away_team_source_id': str(match.get('away_team_id', '')),
+            'away_team_name': match.get('away_team_name'),
             'competition_source_id': str(match.get('competition_id', '')),
+            'competition_name': match.get('competition_name'),
             'season_name': match.get('season', ''),
             'match_date': match.get('date', match.get('match_date')),
             'match_time': match.get('time', match.get('kick_off')),
+            'match_week': match.get('match_week'),
             'home_score': match.get('home_score'),
             'away_score': match.get('away_score'),
             'status': match.get('status', 'unknown'),
+            'competition_stage': match.get('competition_stage'),
             'stadium': match.get('stadium', match.get('venue')),
             'referee': match.get('referee'),
             'attendance': match.get('attendance')
         }
+
+    def _coerce_match_date(self, value: Any) -> Optional[date]:
+        """Convert assorted date inputs to ``date`` objects."""
+        if isinstance(value, date):
+            return value
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, str) and value:
+            for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+                try:
+                    return datetime.strptime(value, fmt).date()
+                except ValueError:
+                    continue
+        return None
 
     def load(self, data: List[Dict[str, Any]]) -> int:
         """Load staged matches and mark corresponding raw rows as processed.
@@ -513,14 +691,19 @@ class JobStageMatches(BaseETLJob):
                     source=staged["source"],
                     source_match_id=staged["source_match_id"],
                     home_team_source_id=staged["home_team_source_id"],
+                     home_team_name=staged.get("home_team_name"),
                     away_team_source_id=staged["away_team_source_id"],
+                     away_team_name=staged.get("away_team_name"),
                     competition_source_id=staged["competition_source_id"],
+                     competition_name=staged.get("competition_name"),
                     season_name=staged["season_name"],
                     match_date=staged["match_date"],
                     match_time=staged["match_time"],
+                     match_week=staged.get("match_week"),
                     home_score=staged["home_score"],
                     away_score=staged["away_score"],
                     status=staged["status"],
+                     competition_stage=staged.get("competition_stage"),
                     stadium=staged["stadium"],
                     referee=staged["referee"],
                     attendance=staged["attendance"],
@@ -538,24 +721,45 @@ class JobStageMatches(BaseETLJob):
             return loaded_count
 
 
-def _get_or_create_dim_team(session: Session, name: str, source: str, source_team_id: str) -> int:
-    """Resolve or create a ``DimTeam`` record for a StatsBomb team.
-
-    For now we maintain a single name + source_id mapping; later this can be
-    expanded to use the full ``EntityMapper`` abstraction.
-    """
+def _get_or_create_dim_team(
+    session: Session,
+    source: str,
+    source_team_id: str,
+    team_name: Optional[str] = None,
+    short_name: Optional[str] = None,
+    country: Optional[str] = None,
+) -> int:
+    """Resolve or create a ``DimTeam`` record for a team."""
 
     query = session.query(DimTeam)
     if source == "statsbomb":
         query = query.filter(DimTeam.statsbomb_id == source_team_id)
     else:
-        query = query.filter(DimTeam.team_name == name)
+        lookup_name = team_name or source_team_id
+        query = query.filter(DimTeam.team_name == lookup_name)
 
     existing = query.one_or_none()
     if existing:
         return existing.team_id
 
-    team = DimTeam(team_name=name)
+    stg_team = (
+        session.query(StgTeam)
+        .filter(
+            StgTeam.source == source,
+            StgTeam.source_team_id == source_team_id,
+        )
+        .one_or_none()
+    )
+
+    resolved_name = team_name or (stg_team.name if stg_team else None) or source_team_id
+    resolved_short = short_name or (stg_team.short_name if stg_team else None)
+    resolved_country = country or (stg_team.country if stg_team else None)
+
+    team = DimTeam(
+        team_name=resolved_name,
+        team_short_name=resolved_short,
+        country=resolved_country,
+    )
     if source == "statsbomb":
         team.statsbomb_id = source_team_id
     session.add(team)
@@ -622,6 +826,68 @@ def _get_or_create_dim_season(session: Session, season_name: str) -> int:
     return season.season_id
 
 
+def _get_or_create_dim_player(
+    session: Session,
+    source: str,
+    source_player_id: Optional[str],
+    fallback_name: Optional[str] = None,
+) -> Optional[int]:
+    """Resolve or create ``DimPlayer`` records using staged metadata."""
+
+    if not source_player_id:
+        return None
+
+    query = session.query(DimPlayer)
+    if source == "statsbomb":
+        query = query.filter(DimPlayer.statsbomb_id == source_player_id)
+    else:
+        lookup_name = fallback_name or source_player_id
+        query = query.filter(DimPlayer.player_name == lookup_name)
+
+    existing = query.one_or_none()
+    if existing:
+        return existing.player_id
+
+    stg_player = (
+        session.query(StgPlayer)
+        .filter(
+            StgPlayer.source == source,
+            StgPlayer.source_player_id == source_player_id,
+        )
+        .one_or_none()
+    )
+
+    resolved_name = fallback_name or (stg_player.name if stg_player else None) or source_player_id
+
+    player = DimPlayer(
+        player_name=resolved_name,
+        first_name=stg_player.first_name if stg_player else None,
+        last_name=stg_player.last_name if stg_player else None,
+        date_of_birth=stg_player.date_of_birth if stg_player else None,
+        nationality=stg_player.nationality if stg_player else None,
+        primary_position=stg_player.position if stg_player else None,
+        height_cm=stg_player.height_cm if stg_player else None,
+        weight_kg=stg_player.weight_kg if stg_player else None,
+        preferred_foot=stg_player.preferred_foot if stg_player else None,
+    )
+
+    if source == "statsbomb":
+        player.statsbomb_id = source_player_id
+
+    session.add(player)
+    session.flush()
+    return player.player_id
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    """Best-effort float conversion."""
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def load_fact_matches_from_staging(session: Session, source: str) -> int:
     """Materialize ``FactMatch`` records from ``StgMatch`` rows for a source.
 
@@ -632,23 +898,25 @@ def load_fact_matches_from_staging(session: Session, source: str) -> int:
     created = 0
 
     for stg in staged_matches:
+        if not stg.home_team_source_id or not stg.away_team_source_id:
+            continue
         # Resolve dimensions
         home_team_id = _get_or_create_dim_team(
             session,
-            name=stg.home_team_source_id,
             source=source,
             source_team_id=stg.home_team_source_id,
+            team_name=stg.home_team_name,
         )
         away_team_id = _get_or_create_dim_team(
             session,
-            name=stg.away_team_source_id,
             source=source,
             source_team_id=stg.away_team_source_id,
+            team_name=stg.away_team_name,
         )
 
         competition_id = _get_or_create_dim_competition(
             session,
-            name=stg.competition_source_id,
+            name=stg.competition_name or stg.competition_source_id,
             source=source,
             source_id=stg.competition_source_id,
         )
@@ -673,6 +941,7 @@ def load_fact_matches_from_staging(session: Session, source: str) -> int:
             away_score=stg.away_score,
             match_date=stg.match_date,
             match_time=stg.match_time,
+            matchweek=stg.match_week,
             status=stg.status or "finished",
             stadium=stg.stadium,
             attendance=stg.attendance,
@@ -681,6 +950,117 @@ def load_fact_matches_from_staging(session: Session, source: str) -> int:
             source_match_id=stg.source_match_id,
         )
         session.add(fact)
+        created += 1
+
+    return created
+
+
+def load_fact_events_from_staging(session: Session, source: str, limit: Optional[int] = None) -> int:
+    """Materialize ``FactEvent`` rows from ``StgEvent`` for a source."""
+
+    query = session.query(StgEvent).filter(StgEvent.source == source).order_by(StgEvent.id)
+    staged_events: List[StgEvent] = query.limit(limit).all() if limit else query.all()
+    if not staged_events:
+        return 0
+
+    existing_ids = {
+        row[0]
+        for row in session.query(FactEvent.source_event_id)
+        .filter(FactEvent.source == source)
+        .all()
+    }
+
+    match_map: Dict[str, FactMatch] = {
+        match.source_match_id: match
+        for match in session.query(FactMatch).filter(FactMatch.source == source)
+    }
+
+    stg_team_lookup: Dict[str, StgTeam] = {
+        row.source_team_id: row
+        for row in session.query(StgTeam).filter(StgTeam.source == source)
+    }
+    stg_player_lookup: Dict[str, StgPlayer] = {
+        row.source_player_id: row
+        for row in session.query(StgPlayer).filter(StgPlayer.source == source)
+    }
+
+    team_cache: Dict[str, int] = {}
+    player_cache: Dict[str, Optional[int]] = {}
+
+    created = 0
+
+    for stg in staged_events:
+        if not stg.source_event_id or stg.source_event_id in existing_ids:
+            continue
+        if not stg.source_match_id:
+            continue
+        match = match_map.get(stg.source_match_id)
+        if not match:
+            continue
+        if not stg.team_source_id:
+            continue
+
+        team_id = team_cache.get(stg.team_source_id)
+        if team_id is None:
+            team_meta = stg_team_lookup.get(stg.team_source_id)
+            team_id = _get_or_create_dim_team(
+                session,
+                source=source,
+                source_team_id=stg.team_source_id,
+                team_name=team_meta.name if team_meta else None,
+                short_name=team_meta.short_name if team_meta else None,
+                country=team_meta.country if team_meta else None,
+            )
+            team_cache[stg.team_source_id] = team_id
+
+        player_id: Optional[int] = None
+        player_source_id = stg.player_source_id or None
+        if player_source_id:
+            if player_source_id in player_cache:
+                player_id = player_cache[player_source_id]
+            else:
+                player_meta = stg_player_lookup.get(player_source_id)
+                fallback_name = player_meta.name if player_meta else None
+                player_id = _get_or_create_dim_player(
+                    session,
+                    source=source,
+                    source_player_id=player_source_id,
+                    fallback_name=fallback_name,
+                )
+                player_cache[player_source_id] = player_id
+
+        extra = parse_extra_data(stg.extra_data)
+        progressive_flag = extra.get('progressive')
+        under_pressure = extra.get('under_pressure')
+
+        fact = FactEvent(
+            match_id=match.match_id,
+            team_id=team_id,
+            player_id=player_id,
+            event_type=stg.event_type,
+            event_subtype=stg.event_subtype,
+            minute=stg.minute,
+            second=stg.second,
+            period=stg.period,
+            location_x=stg.location_x,
+            location_y=stg.location_y,
+            end_location_x=stg.end_location_x,
+            end_location_y=stg.end_location_y,
+            outcome=stg.outcome,
+            is_successful=stg.is_successful,
+            xg=_safe_float(extra.get('xg')),
+            pass_length=_safe_float(extra.get('pass_length')),
+            pass_angle=_safe_float(extra.get('pass_angle')),
+            carry_distance=_safe_float(extra.get('carry_distance')),
+            possession_sequence_id=extra.get('possession'),
+            is_progressive=bool(progressive_flag) if progressive_flag is not None else None,
+            is_under_pressure=bool(under_pressure) if under_pressure is not None else None,
+            source=source,
+            source_event_id=stg.source_event_id,
+            extra_data=extra,
+        )
+        session.add(fact)
+        existing_ids.add(stg.source_event_id)
         created += 1
 
     return created
@@ -717,6 +1097,17 @@ class JobStageEvents(BaseETLJob):
         'Foul Won': 'foul_won',
         'Block': 'block',
         'Ball Recovery': 'ball_recovery',
+        'Goal Keeper': 'goal_keeper',
+        'Substitution': 'substitution',
+        'Miscontrol': 'miscontrol',
+        'Error': 'error',
+        'Offside': 'offside',
+        'Own Goal Against': 'own_goal_against',
+        'Shield': 'shield',
+        'Injury Stoppage': 'injury',
+        'Half Start': 'half_start',
+        'Half End': 'half_end',
+        'Referee Ball-Drop': 'drop_ball',
         # Wyscout mappings
         'pass': 'pass',
         'shot': 'shot',
@@ -726,18 +1117,25 @@ class JobStageEvents(BaseETLJob):
         'others_on_ball': 'other',
     }
 
-    def __init__(self, config: PipelineConfig):
+    def __init__(self, config: PipelineConfig, match_ids: Optional[List[str]] = None):
         super().__init__(config)
+        self.match_ids = match_ids
 
     def extract(self) -> List[Dict[str, Any]]:
         """Get unprocessed raw events for this source."""
 
         with get_session() as session:
-            rows: List[RawEvent] = (
+            query = (
                 session.query(RawEvent)
-                .filter(RawEvent.processed.is_(False), RawEvent.source == self.config.source)
-                .all()
+                .filter(RawEvent.source == self.config.source)
             )
+
+            if self.match_ids:
+                query = query.filter(RawEvent.source_match_id.in_(self.match_ids))
+            else:
+                query = query.filter(RawEvent.processed.is_(False))
+
+            rows: List[RawEvent] = query.all()
 
             return [
                 {
@@ -756,11 +1154,13 @@ class JobStageEvents(BaseETLJob):
 
         for raw in data:
             try:
-                event_json = json.loads(raw['raw_json'])
+                # ``raw['raw_json']`` is already a dict from the JSON column
+                event_json = raw['raw_json']
                 staged = self._parse_event(event_json, raw['source'])
                 staged['source'] = raw['source']
                 staged['source_event_id'] = raw['source_event_id']
                 staged['source_match_id'] = raw['source_match_id']
+                staged['raw_id'] = raw['id']
                 transformed.append(staged)
             except Exception as e:
                 self.logger.error(f"Failed to parse event {raw['source_event_id']}: {e}")
@@ -793,6 +1193,7 @@ class JobStageEvents(BaseETLJob):
 
         raw_type = event.get('type', {}).get('name', '')
         event_type = self.EVENT_TYPE_MAPPING.get(raw_type, raw_type.lower())
+        extra_data = self._get_extra_data_statsbomb(event)
 
         return {
             'event_type': event_type,
@@ -808,7 +1209,7 @@ class JobStageEvents(BaseETLJob):
             'team_source_id': str(event.get('team', {}).get('id', '')),
             'outcome': self._get_outcome_statsbomb(event),
             'is_successful': self._is_successful_statsbomb(event),
-            'extra_data': json.dumps(self._get_extra_data_statsbomb(event))
+            'extra_data': extra_data,
         }
 
     def _get_end_location_statsbomb(self, event: Dict) -> Optional[List[float]]:
@@ -826,11 +1227,29 @@ class JobStageEvents(BaseETLJob):
         event_type = event.get('type', {}).get('name', '')
 
         if event_type == 'Pass':
-            return event.get('pass', {}).get('technique', {}).get('name')
+            data = event.get('pass', {})
+            return (
+                data.get('type', {}).get('name')
+                or data.get('technique', {}).get('name')
+            )
         if event_type == 'Shot':
-            return event.get('shot', {}).get('technique', {}).get('name')
+            data = event.get('shot', {})
+            return (
+                data.get('type', {}).get('name')
+                or data.get('technique', {}).get('name')
+            )
         if event_type == 'Duel':
             return event.get('duel', {}).get('type', {}).get('name')
+        if event_type == 'Goal Keeper':
+            return event.get('goalkeeper', {}).get('type', {}).get('name')
+        if event_type == 'Foul Committed':
+            return event.get('foul_committed', {}).get('type', {}).get('name')
+        if event_type == 'Foul Won':
+            return event.get('foul_won', {}).get('type', {}).get('name')
+        if event_type == 'Miscontrol':
+            return event.get('miscontrol', {}).get('type', {}).get('name')
+        if event_type == 'Pressure':
+            return event.get('pressure', {}).get('type', {}).get('name')
 
         return None
 
@@ -844,6 +1263,14 @@ class JobStageEvents(BaseETLJob):
             return event.get('shot', {}).get('outcome', {}).get('name')
         if event_type == 'Dribble':
             return event.get('dribble', {}).get('outcome', {}).get('name')
+        if event_type == 'Duel':
+            return event.get('duel', {}).get('outcome', {}).get('name')
+        if event_type == 'Ball Receipt*':
+            return event.get('ball_receipt', {}).get('outcome', {}).get('name')
+        if event_type == 'Interception':
+            return event.get('interception', {}).get('outcome', {}).get('name')
+        if event_type == 'Goal Keeper':
+            return event.get('goalkeeper', {}).get('outcome', {}).get('name')
 
         return None
 
@@ -859,42 +1286,98 @@ class JobStageEvents(BaseETLJob):
         if event_type == 'Dribble':
             return outcome == 'Complete'
         if event_type == 'Duel':
-            return event.get('duel', {}).get('outcome', {}).get('name') in ['Won', 'Success']
+            duel_outcome = event.get('duel', {}).get('outcome', {}).get('name')
+            return duel_outcome in ['Won', 'Success']
+        if event_type == 'Ball Receipt*':
+            return outcome == 'Complete'
+        if event_type == 'Ball Recovery':
+            return True
+        if event_type == 'Interception':
+            return outcome not in {'Lost', 'Incomplete', None}
+        if event_type == 'Pressure':
+            return bool(event.get('counterpress'))
+        if event_type == 'Clearance':
+            return True
+        if event_type == 'Goal Keeper':
+            gk_outcome = event.get('goalkeeper', {}).get('outcome', {}).get('name')
+            if gk_outcome is None:
+                return None
+            return gk_outcome not in {'Failed'}
+        if event_type == 'Foul Won':
+            return True
+        if event_type == 'Foul Committed':
+            return False
 
         return None
 
     def _get_extra_data_statsbomb(self, event: Dict) -> Dict[str, Any]:
         """Extract additional event-specific data."""
-        extra = {}
+        extra: Dict[str, Any] = {
+            'play_pattern': event.get('play_pattern', {}).get('name'),
+            'possession': event.get('possession'),
+            'possession_team_id': event.get('possession_team', {}).get('id'),
+            'duration': event.get('duration'),
+            'counterpress': event.get('counterpress', False),
+            'under_pressure': event.get('under_pressure', False),
+        }
+
+        start_loc = event.get('location')
 
         if 'pass' in event:
             pass_data = event['pass']
-            extra['pass_length'] = pass_data.get('length')
-            extra['pass_angle'] = pass_data.get('angle')
-            extra['pass_height'] = pass_data.get('height', {}).get('name')
-            extra['cross'] = pass_data.get('cross', False)
-            extra['switch'] = pass_data.get('switch', False)
-            extra['through_ball'] = pass_data.get('through_ball', False)
+            end_loc = pass_data.get('end_location')
+            extra.update({
+                'pass_length': pass_data.get('length'),
+                'pass_angle': pass_data.get('angle'),
+                'pass_height': pass_data.get('height', {}).get('name'),
+                'pass_body_part': pass_data.get('body_part', {}).get('name'),
+                'pass_type': pass_data.get('type', {}).get('name'),
+                'pass_technique': pass_data.get('technique', {}).get('name'),
+                'pass_outcome': pass_data.get('outcome', {}).get('name'),
+                'pass_recipient_id': pass_data.get('recipient', {}).get('id'),
+                'cross': pass_data.get('cross', False),
+                'switch': pass_data.get('switch', False),
+                'through_ball': pass_data.get('through_ball', False),
+                'cut_back': pass_data.get('cut_back', False),
+                'shot_assist': pass_data.get('shot_assist', False),
+                'goal_assist': pass_data.get('goal_assist', False),
+                'progressive': self._is_progressive_event(start_loc, end_loc),
+            })
 
         if 'shot' in event:
             shot_data = event['shot']
-            extra['xg'] = shot_data.get('statsbomb_xg')
-            extra['body_part'] = shot_data.get('body_part', {}).get('name')
-            extra['type'] = shot_data.get('type', {}).get('name')
+            extra.update({
+                'xg': shot_data.get('statsbomb_xg'),
+                'shot_body_part': shot_data.get('body_part', {}).get('name'),
+                'shot_type': shot_data.get('type', {}).get('name'),
+                'shot_technique': shot_data.get('technique', {}).get('name'),
+                'shot_first_time': shot_data.get('first_time', False),
+                'shot_one_on_one': shot_data.get('one_on_one', False),
+                'shot_outcome': shot_data.get('outcome', {}).get('name'),
+                'shot_key_pass_id': shot_data.get('key_pass_id'),
+            })
 
         if 'carry' in event:
             carry_data = event['carry']
             end_loc = carry_data.get('end_location', [])
-            start_loc = event.get('location', [])
             if end_loc and start_loc:
                 extra['carry_distance'] = (
                     ((end_loc[0] - start_loc[0]) ** 2 +
                      (end_loc[1] - start_loc[1]) ** 2) ** 0.5
                 )
+                extra['progressive'] = self._is_progressive_event(start_loc, end_loc)
 
-        extra['under_pressure'] = event.get('under_pressure', False)
+        return {k: v for k, v in extra.items() if v not in (None, [], {})}
 
-        return extra
+    @staticmethod
+    def _is_progressive_event(start: Optional[List[float]], end: Optional[List[float]], threshold: float = 15.0) -> Optional[bool]:
+        """Heuristic to flag progressive ball movement in StatsBomb units."""
+
+        if not start or not end:
+            return None
+        if len(start) < 2 or len(end) < 2:
+            return None
+        return (end[0] - start[0]) >= threshold
 
     def _parse_wyscout_event(self, event: Dict) -> Dict[str, Any]:
         """Parse Wyscout event format."""
@@ -916,7 +1399,7 @@ class JobStageEvents(BaseETLJob):
             'team_source_id': str(event.get('teamId', '')),
             'outcome': None,
             'is_successful': 101 in event.get('tags', []),  # Wyscout success tag
-            'extra_data': json.dumps({'tags': event.get('tags', [])})
+            'extra_data': {'tags': event.get('tags', [])}
         }
 
     def _parse_generic_event(self, event: Dict) -> Dict[str, Any]:
@@ -935,7 +1418,7 @@ class JobStageEvents(BaseETLJob):
             'team_source_id': str(event.get('team_id', '')),
             'outcome': event.get('outcome'),
             'is_successful': event.get('success', event.get('is_successful')),
-            'extra_data': json.dumps(event.get('extra', {}))
+            'extra_data': event.get('extra', {})
         }
 
     def load(self, data: List[Dict[str, Any]]) -> int:
@@ -968,7 +1451,7 @@ class JobStageEvents(BaseETLJob):
                 )
                 session.add(stg)
 
-                raw_id = staged.get("id")
+                raw_id = staged.get("raw_id")
                 if raw_id is not None:
                     session.query(RawEvent).filter(RawEvent.id == raw_id).update({"processed": True})
 
@@ -1140,34 +1623,71 @@ class JobStageEntities(BaseETLJob):
         loaded_count = 0
 
         with get_session() as session:
+            existing_teams = {
+                str(row.source_team_id): row
+                for row in session.query(StgTeam).filter(StgTeam.source == self.config.source)
+            }
+            existing_players = {
+                str(row.source_player_id): row
+                for row in session.query(StgPlayer).filter(StgPlayer.source == self.config.source)
+            }
+
             # Load teams
             for team in entities.get('teams', []):
-                stg_team = StgTeam(
-                    source=self.config.source,
-                    source_team_id=str(team['id']),
-                    name=team['name'],
-                    short_name=team.get('short_name'),
-                    country=team.get('country'),
-                )
-                session.add(stg_team)
+                source_team_id = team.get('source_team_id')
+                if source_team_id is None:
+                    continue
+                source_team_id = str(source_team_id)
+                existing = existing_teams.get(source_team_id)
+                if existing:
+                    existing.name = team.get('name') or existing.name
+                    existing.short_name = team.get('short_name') or existing.short_name
+                    existing.country = team.get('country') or existing.country
+                else:
+                    stg_team = StgTeam(
+                        source=self.config.source,
+                        source_team_id=source_team_id,
+                        name=team.get('name'),
+                        short_name=team.get('short_name'),
+                        country=team.get('country'),
+                    )
+                    session.add(stg_team)
+                    existing_teams[source_team_id] = stg_team
                 loaded_count += 1
 
             # Load players
             for player in entities.get('players', []):
-                stg_player = StgPlayer(
-                    source=self.config.source,
-                    source_player_id=str(player['id']),
-                    name=player['name'],
-                    first_name=player.get('first_name'),
-                    last_name=player.get('last_name'),
-                    date_of_birth=player.get('date_of_birth'),
-                    nationality=player.get('nationality'),
-                    position=player.get('position'),
-                    height_cm=player.get('height_cm'),
-                    weight_kg=player.get('weight_kg'),
-                    preferred_foot=player.get('preferred_foot'),
-                )
-                session.add(stg_player)
+                source_player_id = player.get('source_player_id')
+                if source_player_id is None:
+                    continue
+                source_player_id = str(source_player_id)
+                existing = existing_players.get(source_player_id)
+                if existing:
+                    existing.name = player.get('name') or existing.name
+                    existing.first_name = player.get('first_name') or existing.first_name
+                    existing.last_name = player.get('last_name') or existing.last_name
+                    existing.date_of_birth = player.get('date_of_birth') or existing.date_of_birth
+                    existing.nationality = player.get('nationality') or existing.nationality
+                    existing.position = player.get('position') or existing.position
+                    existing.height_cm = player.get('height_cm') or existing.height_cm
+                    existing.weight_kg = player.get('weight_kg') or existing.weight_kg
+                    existing.preferred_foot = player.get('preferred_foot') or existing.preferred_foot
+                else:
+                    stg_player = StgPlayer(
+                        source=self.config.source,
+                        source_player_id=source_player_id,
+                        name=player.get('name'),
+                        first_name=player.get('first_name'),
+                        last_name=player.get('last_name'),
+                        date_of_birth=player.get('date_of_birth'),
+                        nationality=player.get('nationality'),
+                        position=player.get('position'),
+                        height_cm=player.get('height_cm'),
+                        weight_kg=player.get('weight_kg'),
+                        preferred_foot=player.get('preferred_foot'),
+                    )
+                    session.add(stg_player)
+                    existing_players[source_player_id] = stg_player
                 loaded_count += 1
 
         return loaded_count
@@ -1289,8 +1809,142 @@ class Pipeline:
         # Add jobs in order
         self.add_job(JobIngestMatches(self.config, start_date, end_date, competition_ids))
         self.add_job(JobIngestEvents(self.config))
+        self.add_job(JobIngestLineups(self.config))
         self.add_job(JobStageMatches(self.config))
         self.add_job(JobStageEvents(self.config))
         self.add_job(JobStageEntities(self.config))
 
         return self.run()
+
+
+def load_fact_lineups_from_raw(session: Session, source: str) -> int:
+    """Materialize ``FactLineup`` rows from ``RawLineup`` payloads."""
+
+    raw_lineups: List[RawLineup] = session.query(RawLineup).filter(RawLineup.source == source).all()
+    created = 0
+
+    for raw in raw_lineups:
+        payload = raw.raw_json if isinstance(raw.raw_json, dict) else json.loads(raw.raw_json)
+        if not payload:
+            continue
+
+        match = (
+            session.query(FactMatch)
+            .filter(FactMatch.source == source, FactMatch.source_match_id == raw.source_match_id)
+            .one_or_none()
+        )
+        if not match:
+            continue
+
+        team_id = _get_or_create_dim_team(
+            session,
+            source=source,
+            source_team_id=raw.source_team_id,
+            team_name=payload.get('team_name'),
+        )
+
+        lineup_entries = payload.get('lineup', []) or []
+        for entry in lineup_entries:
+            player_source_id = entry.get('player_id')
+            player_dim_id = _get_or_create_dim_player(
+                session,
+                source=source,
+                source_player_id=str(player_source_id) if player_source_id is not None else None,
+                fallback_name=entry.get('player_name'),
+            )
+            if not player_dim_id:
+                continue
+
+            positions = entry.get('positions', []) or []
+            is_starter = _is_lineup_starter(positions)
+            position_name = _determine_primary_position(positions)
+            sub_on, sub_off = _extract_lineup_minutes(positions)
+
+            minutes_played = None
+            if sub_on is not None or sub_off is not None:
+                start_val = sub_on if sub_on is not None else 0.0
+                default_end = max(_DEFAULT_MATCH_MINUTES, start_val)
+                end_val = sub_off if sub_off is not None else default_end
+                minutes_played = max(0.0, end_val - start_val)
+
+            existing = (
+                session.query(FactLineup)
+                .filter(
+                    FactLineup.match_id == match.match_id,
+                    FactLineup.player_id == player_dim_id,
+                )
+                .one_or_none()
+            )
+
+            payload_kwargs = {
+                'team_id': team_id,
+                'is_starter': is_starter,
+                'position': position_name,
+                'jersey_number': entry.get('jersey_number'),
+                'captain': bool(entry.get('captain', False)),
+                'minutes_played': int(round(minutes_played)) if minutes_played is not None else None,
+                'sub_on_minute': int(round(sub_on)) if sub_on is not None else None,
+                'sub_off_minute': int(round(sub_off)) if sub_off is not None else None,
+            }
+
+            if existing:
+                for key, value in payload_kwargs.items():
+                    setattr(existing, key, value)
+            else:
+                fact_lineup = FactLineup(
+                    match_id=match.match_id,
+                    player_id=player_dim_id,
+                    **payload_kwargs,
+                )
+                session.add(fact_lineup)
+                created += 1
+
+        raw.processed = True
+
+    return created
+
+
+_DEFAULT_MATCH_MINUTES = 90.0
+
+
+def _coerce_clock_to_minute(clock_value: Optional[str]) -> Optional[float]:
+    if not clock_value:
+        return None
+    try:
+        minutes_str, seconds_str = clock_value.split(":")
+        minutes = int(minutes_str)
+        seconds = int(seconds_str)
+        return minutes + seconds / 60
+    except Exception:
+        return None
+
+
+def _extract_lineup_minutes(positions: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float]]:
+    if not positions:
+        return None, None
+
+    start_minute: Optional[float] = None
+    end_minute: Optional[float] = None
+
+    for pos in positions:
+        start_candidate = _coerce_clock_to_minute(pos.get('from'))
+        if start_candidate is not None:
+            start_minute = start_candidate if start_minute is None else min(start_minute, start_candidate)
+
+        end_candidate = _coerce_clock_to_minute(pos.get('to'))
+        if end_candidate is not None:
+            end_minute = end_candidate if end_minute is None else max(end_minute, end_candidate)
+
+    return start_minute, end_minute
+
+
+def _determine_primary_position(positions: List[Dict[str, Any]]) -> Optional[str]:
+    if not positions:
+        return None
+    return positions[0].get('position')
+
+
+def _is_lineup_starter(positions: List[Dict[str, Any]]) -> bool:
+    if not positions:
+        return False
+    return any(pos.get('start_reason') == 'Starting XI' for pos in positions)

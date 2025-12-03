@@ -164,12 +164,17 @@ class StgMatch(Base):
     home_team_source_id = Column(String(100), nullable=False)
     away_team_source_id = Column(String(100), nullable=False)
     competition_source_id = Column(String(100), nullable=False)
+    competition_name = Column(String(200), nullable=True)
     season_name = Column(String(50), nullable=False)  # e.g., "2023/2024"
+    home_team_name = Column(String(200), nullable=True)
+    away_team_name = Column(String(200), nullable=True)
     match_date = Column(Date, nullable=False)
     match_time = Column(String(10), nullable=True)  # HH:MM
+    match_week = Column(Integer, nullable=True)
     home_score = Column(Integer, nullable=True)
     away_score = Column(Integer, nullable=True)
     status = Column(String(20), nullable=True)
+    competition_stage = Column(String(100), nullable=True)
     stadium = Column(String(200), nullable=True)
     referee = Column(String(100), nullable=True)
     attendance = Column(Integer, nullable=True)
