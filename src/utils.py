@@ -118,3 +118,68 @@ def weighted_average(values: list[float], weights: list[float]) -> float:
         return 0.0
 
     return sum(v * w for v, w in zip(values, weights)) / total_weight
+
+
+def normalize_season_name(season_str: str, match_date=None) -> str:
+    """
+    Normalize season to YYYY/YYYY format based on football season cycle.
+    
+    Football seasons run August-July, so:
+    - A match in Aug-Dec 2022 belongs to season "2022/2023"
+    - A match in Jan-Jul 2023 belongs to season "2022/2023"
+    
+    Args:
+        season_str: Season string (e.g., "2022", "2022/2023")
+        match_date: Optional date object to determine season if single year provided
+    
+    Returns:
+        Normalized season string in "YYYY/YYYY" format
+    """
+    from datetime import date
+    
+    # If already in correct format, return as-is
+    if '/' in str(season_str) and len(str(season_str).split('/')) == 2:
+        return str(season_str)
+    
+    # If single year provided, need match_date to determine correct season
+    if match_date:
+        if isinstance(match_date, str):
+            from datetime import datetime
+            match_date = datetime.strptime(match_date, '%Y-%m-%d').date()
+        
+        year = match_date.year
+        month = match_date.month
+        
+        # Aug-Dec: current year is start year
+        if month >= 8:
+            return f"{year}/{year + 1}"
+        # Jan-Jul: previous year is start year
+        else:
+            return f"{year - 1}/{year}"
+    
+    # Fallback: assume single year is the start year
+    try:
+        year = int(season_str)
+        return f"{year}/{year + 1}"
+    except (ValueError, TypeError):
+        return str(season_str)
+
+
+def sort_seasons(season_names: list[str]) -> list[str]:
+    """
+    Sort season names chronologically.
+    
+    Args:
+        season_names: List of season strings (e.g., ["2022/2023", "2018/2019"])
+    
+    Returns:
+        Sorted list of season names
+    """
+    def season_key(s):
+        parts = str(s).split('/')
+        try:
+            return int(parts[0])
+        except (ValueError, IndexError):
+            return 0
+    
+    return sorted(season_names, key=season_key)

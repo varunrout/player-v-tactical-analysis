@@ -679,6 +679,7 @@ class JobStageMatches(BaseETLJob):
         This method writes into ``stg_match`` and flips the ``processed`` flag
         on ``raw_match`` so that subsequent runs only operate on new data.
         """
+        from src.utils import normalize_season_name
 
         if not data:
             return 0
@@ -686,6 +687,12 @@ class JobStageMatches(BaseETLJob):
         with get_session() as session:
             loaded_count = 0
             for staged in data:
+                # Normalize season name using match date context
+                normalized_season = normalize_season_name(
+                    staged["season_name"], 
+                    staged["match_date"]
+                )
+                
                 # Insert into staging table
                 stg = StgMatch(
                     source=staged["source"],
@@ -696,7 +703,7 @@ class JobStageMatches(BaseETLJob):
                      away_team_name=staged.get("away_team_name"),
                     competition_source_id=staged["competition_source_id"],
                      competition_name=staged.get("competition_name"),
-                    season_name=staged["season_name"],
+                    season_name=normalized_season,
                     match_date=staged["match_date"],
                     match_time=staged["match_time"],
                      match_week=staged.get("match_week"),
@@ -790,37 +797,48 @@ def _get_or_create_dim_competition(session: Session, name: str, source: str, sou
     return comp.competition_id
 
 
-def _get_or_create_dim_season(session: Session, season_name: str) -> int:
-    """Resolve or create a ``DimSeason`` from a StatsBomb-like season string.
+def _get_or_create_dim_season(session: Session, season_name: str, match_date: Optional[date] = None) -> int:
+    """Resolve or create a ``DimSeason`` from a season string.
 
-    StatsBomb typically uses labels like "2019/2020"; here we approximate
-    ``start_date``/``end_date`` using the start and end years.
+    Normalizes season names to YYYY/YYYY format based on football season cycle (August-July).
+    StatsBomb typically uses labels like "2019/2020".
+    
+    Args:
+        session: Database session
+        season_name: Season string (e.g., "2022/2023" or "2022")
+        match_date: Optional match date to help normalize single-year seasons
+    
+    Returns:
+        season_id for the normalized season
     """
+    from src.utils import normalize_season_name
+    
+    # Normalize the season name using match date context if available
+    normalized_season = normalize_season_name(season_name, match_date)
 
-    season = session.query(DimSeason).filter(DimSeason.season_name == season_name).one_or_none()
+    season = session.query(DimSeason).filter(DimSeason.season_name == normalized_season).one_or_none()
     if season:
         return season.season_id
 
-    # Heuristic: split on '/' to infer start/end years, fall back to 1 July
-    start_year = None
-    end_year = None
+    # Parse years from normalized format
     try:
-        parts = season_name.split("/")
+        parts = normalized_season.split("/")
         if len(parts) == 2:
             start_year = int(parts[0])
             end_year = int(parts[1])
+        else:
+            # Fallback if normalization failed
+            start_year = datetime.utcnow().year
+            end_year = start_year + 1
     except Exception:
-        pass
-
-    if start_year is None or end_year is None:
-        # Fallback: use match date year span; here we just set something valid
         start_year = datetime.utcnow().year
-        end_year = start_year
+        end_year = start_year + 1
 
-    start_date = datetime(start_year, 7, 1).date()
-    end_date = datetime(end_year, 6, 30).date()
+    # Football season: Aug 1 to Jul 31 next year
+    start_date = datetime(start_year, 8, 1).date()
+    end_date = datetime(end_year, 7, 31).date()
 
-    season = DimSeason(season_name=season_name, start_date=start_date, end_date=end_date)
+    season = DimSeason(season_name=normalized_season, start_date=start_date, end_date=end_date)
     session.add(season)
     session.flush()
     return season.season_id
@@ -921,7 +939,7 @@ def load_fact_matches_from_staging(session: Session, source: str) -> int:
             source_id=stg.competition_source_id,
         )
 
-        season_id = _get_or_create_dim_season(session, stg.season_name)
+        season_id = _get_or_create_dim_season(session, stg.season_name, stg.match_date)
 
         # Upsert-style behaviour based on (source, source_match_id)
         existing = (
