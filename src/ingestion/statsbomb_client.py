@@ -75,6 +75,37 @@ class StatsBombClient:
 
         return data
 
+    def get_competitions(self) -> List[Dict[str, Any]]:
+        """Return all available competitions from StatsBomb Open Data.
+
+        StatsBomb Open stores competitions at::
+
+            data/competitions.json
+
+        The relative path may be overridden with ``STATSBOMB_COMPETITIONS_PATH``.
+        """
+
+        path_template = os.getenv(
+            "STATSBOMB_COMPETITIONS_PATH",
+            "competitions.json",
+        )
+        path = path_template
+
+        resp = self._client.get(path)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not isinstance(data, list):
+            raise ValueError("Expected list of competitions from StatsBomb Open data")
+
+        return data
+
+    def get_competition_seasons(self, competition_id: int) -> List[Dict[str, Any]]:
+        """Return seasons for a given competition from competitions listing."""
+
+        competitions = self.get_competitions()
+        return [c for c in competitions if c.get("competition_id") == competition_id]
+
     def get_events(self, match_id: int) -> List[Dict[str, Any]]:
         """Return event list for a given match from GitHub.
 

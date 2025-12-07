@@ -1,0 +1,25 @@
+competition_id,competition_name,season_id,season_name,num_matches,status
+9,1. Bundesliga,27,2015/2016,306,available
+9,1. Bundesliga,281,2023/2024,34,available
+11,La Liga,278,1973/1974,1,available
+11,La Liga,37,2004/2005,7,available
+11,La Liga,38,2005/2006,17,available
+11,La Liga,39,2006/2007,26,available
+11,La Liga,40,2007/2008,28,available
+11,La Liga,41,2008/2009,31,available
+11,La Liga,21,2009/2010,35,available
+11,La Liga,22,2010/2011,33,available
+11,La Liga,23,2011/2012,37,available
+11,La Liga,24,2012/2013,32,available
+11,La Liga,25,2013/2014,31,available
+11,La Liga,26,2014/2015,38,available
+11,La Liga,27,2015/2016,380,available
+11,La Liga,2,2016/2017,34,available
+11,La Liga,1,2017/2018,36,available
+11,La Liga,4,2018/2019,34,available
+11,La Liga,42,2019/2020,33,available
+11,La Liga,90,2020/2021,35,available
+2,Premier League,44,2003/2004,38,available
+2,Premier League,27,2015/2016,380,available
+12,Serie A,86,1986/1987,1,available
+12,Serie A,27,2015/2016,380,available
